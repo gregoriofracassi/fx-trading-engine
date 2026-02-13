@@ -6,5 +6,19 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  schemas  = []
+  schemas  = ["ea_gateway"]
+}
+
+// ─── EA Gateway ───────────────────────────────────────────────────────────────
+
+model AuditEvent {
+  id          String   @id @default(cuid())
+  terminalId  String
+  type        String
+  sequenceNum Int?
+  sentAt      DateTime?
+  payload     Json
+  createdAt   DateTime @default(now())
+
+  @@schema("ea_gateway")
 }

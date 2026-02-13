@@ -20,7 +20,7 @@ async function bootstrap() {
   app.useGlobalFilters(new ApplicationExceptionFilter());
 
   const config = new DocumentBuilder()
-    .setTitle('Job Search Automation API')
+    .setTitle('FX Trading Engine API')
     .setVersion('1.0')
     .addBearerAuth()
     .build();

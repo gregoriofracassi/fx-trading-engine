@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: job_search
+      POSTGRES_DB: fx_trading
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
