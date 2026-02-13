@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/gregoriofracassi/Projects/job-search-automation ls-files:*)",
+      "Bash(unzip:*)",
+      "WebFetch(domain:code.claude.com)",
+      "Bash(rm:*)",
+      "Bash(pnpm install)",
+      "Bash(pnpm exec husky:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
