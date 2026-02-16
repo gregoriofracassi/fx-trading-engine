@@ -1,6 +1,6 @@
 ---
 name: nest-js-server
-description: NestJS backend (brain) specification for the FX trading engine. Covers 8 subsystems — API Ingestion, Data Store, News Service, State Machines (Asia/Zone/Daily), Strategy Engine (S1/SSA/Mutazione), Risk Manager, Command Outbox, Audit & Reconciliation — plus end-to-end flows and module structure.
+description: NestJS backend (brain) specification for the FX trading engine. Covers 9 subsystems — API Ingestion, Data Store, News Service, State Machines (Asia/Zone/Daily), Strategy Engine (S1/SSA/Mutazione), Risk Manager, Command Outbox, Audit & Reconciliation, and Backtest Engine — plus end-to-end flows and module structure.
 ---
 
 # NestJS Backend — Brain Specification
@@ -14,7 +14,7 @@ The backend must be able to **reconstruct everything from DB alone** — bars, e
 
 ---
 
-## 0. Mental Model — 8 Subsystems
+## 0. Mental Model — 9 Subsystems
 
 1. API Ingestion (EA → Backend)
 2. Data Store (bars/orders/positions/events) + Normalization
@@ -23,7 +23,8 @@ The backend must be able to **reconstruct everything from DB alone** — bars, e
 5. Strategy Engine (S1/SSA/Mutazione: valid/invalid + metrics)
 6. Risk Manager (policy + FTMO constraints + orchestration)
 7. Command Outbox (reliable queue for EA)
-8. Audit + Monitoring + Replay/Backtest
+8. Audit + Monitoring + Reconciliation
+9. Backtest Engine (on-demand asset validation + strategy replay)
 
 ---
 
@@ -34,6 +35,7 @@ The backend must be able to **reconstruct everything from DB alone** — bars, e
 The entry point for all live data.
 
 **Events received:**
+
 - `BAR_M15_CLOSED`
 - `ORDER_PLACED`
 - `ORDER_FILLED`
@@ -45,6 +47,7 @@ The entry point for all live data.
 - `HEARTBEAT`
 
 **Always on receipt:**
+
 1. Authenticate (API key / HMAC)
 2. Validate schema (Zod or class-validator)
 3. Idempotency check: every event must have an `eventId` or `(terminalId + sequenceNumber)`. If already seen → return 200 (ignore).
@@ -64,6 +67,7 @@ EA polls this endpoint.
 - Limit results (e.g. max 5 at a time)
 
 **Recommended status flow:**
+
 - `PENDING` → `DELIVERED` (when EA downloads) → `ACKED` (on success) or `FAILED`
 - Simpler alternative: stay `PENDING` until ACK arrives
 
@@ -72,6 +76,7 @@ EA polls this endpoint.
 EA confirms command execution.
 
 Actions:
+
 1. Validate payload
 2. Update `EaCommand.status`:
    - SUCCESS → `ACKED`
@@ -87,26 +92,31 @@ This layer makes everything replayable.
 
 ### Minimum Tables (Live)
 
-| Table | Purpose |
-|---|---|
-| `BarM15` | OHLC candles from EA |
-| `EconomicEvent` | News calendar events |
-| `AsiaRange` | Daily high/low per symbol for Asia session |
-| `Zone`, `ZoneState` | Zone engine state |
-| `Signal` | All signals (valid and invalid) with metrics |
-| `TradePlan` | Approved trade proposals |
-| `EaCommand` | Command outbox |
-| `Order`, `Position` | Live order/position state |
-| `DailyState` | Per-day counters and halt flags |
-| `AuditEvent` | Append-only event log (everything) |
+| Table               | Purpose                                                                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BarM15`            | OHLC candles. Shared by live and backtest. `source` column: `FTMO_LIVE` (from EA) or `HISTORICAL` (fetched for backtest). Unique key: `(symbol, timeOpen)`. |
+| `EconomicEvent`     | News calendar events                                                                                                                                        |
+| `AsiaRange`         | Daily high/low per symbol for Asia session                                                                                                                  |
+| `Zone`, `ZoneState` | Zone engine state                                                                                                                                           |
+| `Signal`            | All signals (valid and invalid) with metrics                                                                                                                |
+| `TradePlan`         | Approved trade proposals                                                                                                                                    |
+| `EaCommand`         | Command outbox                                                                                                                                              |
+| `Order`, `Position` | Live order/position state                                                                                                                                   |
+| `DailyState`        | Per-day counters and halt flags                                                                                                                             |
+| `AuditEvent`        | Append-only event log (everything)                                                                                                                          |
+| `BacktestRun`       | One record per backtest run: symbol, date range, params, status, summary stats                                                                              |
+| `BacktestSignal`    | One record per signal produced during a backtest run: setup kind, valid/invalid, metrics, simulated outcome                                                 |
 
 ### Bar Normalization
 
 On each `BAR_M15_CLOSED` event:
+
 - Normalize: symbol, `timeOpen`, `timeClose`, prices as double, `spreadPoints`
-- Upsert into `BarM15` with unique constraint on `(symbol, timeOpen)`
+- Upsert into `BarM15` with `source = 'FTMO_LIVE'`, unique constraint on `(symbol, timeOpen)`
 
 > `timeOpen` is the natural key in MT5. Pick one and never change it.
+>
+> Historical candles fetched for backtesting use the same table and same upsert logic with `source = 'HISTORICAL'`. The unique constraint prevents duplication regardless of source.
 
 ---
 
@@ -117,6 +127,7 @@ A separate module responsible for economic calendar gating.
 ### Responsibilities
 
 Provide deterministic gating functions:
+
 1. `isAllDayBlackout(date)` → USD CPI / FOMC
 2. `isFirstFriday(date)` → NFP day
 3. `isRedNewsWindow(now, currencies, ±15min)` → 3-star news proximity
@@ -129,6 +140,7 @@ Provide deterministic gating functions:
 - Recommended source: **TradingEconomics API**
 
 **Persist per event:**
+
 - `timeUtc`
 - `currency`
 - `impact` (red / 3-star)
@@ -147,12 +159,14 @@ This is the "context" the strategy requires.
 ### 4.1 DailyStateMachine
 
 Maintains global daily state:
+
 - `date`
 - `slCountGlobal`
 - `haltedForDay` (boolean)
 - Future: max daily loss (FTMO), max drawdown, etc.
 
 **Updates:**
+
 - On `SL_HIT` event → increment `slCount`
 - If `slCount >= 3` → set `haltedForDay = true`, optionally generate cancel commands
 
@@ -161,12 +175,14 @@ Maintains global daily state:
 ### 4.2 AsiaSessionState
 
 On each closed bar:
+
 - If `barTime` is within [01:00, 08:15) → update running `max(high)` / `min(low)`
 - When time passes 08:15 → **finalize** `AsiaRange(symbol, date, high, low)`
 
 ### 4.3 Zone Engine State (per symbol)
 
 Maintains:
+
 - Current zone
 - Peripheral zone
 - A+P zone
@@ -177,6 +193,7 @@ Maintains:
 **When updated:** On each M15 bar close (at minimum whenever breakouts/rottures are detected).
 
 **Output:** `ZoneContext` for the Strategy Engine:
+
 - Relationship type (concordant / discordant / none)
 - `rrTarget` (3 or 4)
 - Gating flags (e.g. "wait for 75% peripheral")
@@ -186,16 +203,19 @@ Maintains:
 ## 5. Strategy Engine (S1 / SSA / Mutazione)
 
 ### Input:
+
 - Last N bars
 - `AsiaRange` for the day
 - `ZoneContext`
 
 ### Output:
+
 - `SignalValid` or `SignalInvalid` with metrics and reason codes
 
 ### Philosophy
 
 The strategy logic must be **explainable, not opaque**. For every check, save:
+
 - Calculated metrics
 - Thresholds used
 - Invalidation reasons
@@ -240,6 +260,7 @@ This lets you answer: **"Why didn't it trade today?"**
 The final gate before issuing commands.
 
 ### Input:
+
 - Valid signal
 - Proposed trade plan
 - `DailyState`
@@ -251,6 +272,7 @@ The final gate before issuing commands.
 ### Processing
 
 **Step A — Hard rules (non-negotiable rejections):**
+
 - `haltedForDay` = true → reject
 - Outside trading hours → reject
 - First Friday → reject
@@ -259,6 +281,7 @@ The final gate before issuing commands.
 - Open position already exists on symbol → reject
 
 **Step B — Strategy context rules:**
+
 - Cancel-if-reached-1:2-without-fill (pending order management)
 - RR target 1:3 or 1:4 (from zone context)
 - 16:30: no new pending (or generate cancel command)
@@ -266,6 +289,7 @@ The final gate before issuing commands.
 
 **Step C — If approved:**
 Create command(s) in outbox:
+
 - `PLACE_PENDING` or `PLACE_MARKET`
 - `CANCEL_ORDER`
 - `MODIFY_SL_TO_BE`
@@ -280,6 +304,7 @@ Save `TradePlan` with link to `SignalId`.
 ### Why an Outbox?
 
 To prevent:
+
 - Deciding, then crashing before sending
 - Duplicate commands
 - Loss of traceability ("who requested what")
@@ -295,12 +320,12 @@ This prevents two `PLACE_ORDER` commands from the same signal.
 
 ### Command States
 
-| State | Description |
-|---|---|
-| `PENDING` | Created, not yet seen by EA |
+| State       | Description                 |
+| ----------- | --------------------------- |
+| `PENDING`   | Created, not yet seen by EA |
 | `DELIVERED` | EA downloaded it (optional) |
-| `ACKED` | EA executed and confirmed |
-| `FAILED` | EA reported failure |
+| `ACKED`     | EA executed and confirmed   |
+| `FAILED`    | EA reported failure         |
 
 ---
 
@@ -309,6 +334,7 @@ This prevents two `PLACE_ORDER` commands from the same signal.
 ### 8.1 AuditEvent (Append-Only)
 
 Write a record for **every meaningful event**:
+
 - Received event (bar, trade event)
 - Signal generated (valid or invalid)
 - Risk approval or rejection
@@ -320,6 +346,7 @@ This enables: replay, debugging, reporting.
 ### 8.2 Reconciliation
 
 Every X minutes:
+
 - Receive (push) or request (pull) an `ACCOUNT_SNAPSHOT` from EA
 - Compare DB state vs. reality:
   - "Thought it was pending but it's already filled"
@@ -373,6 +400,76 @@ Every X minutes:
 
 ---
 
+## 9. Backtest Engine
+
+### Purpose
+
+On-demand asset validation and strategy replay. Triggered manually. Never runs automatically. Never issues real commands to the EA.
+
+Three use cases:
+
+- **Asset validation** — before enabling a symbol for live trading, confirm ≥30 valid signals over 6 months of historical M15 data.
+- **Strategy verification** — after going live, confirm live signal frequency and quality is consistent with backtest expectations.
+- **Parameter calibration** — test threshold changes before applying them to live.
+
+### API
+
+```
+POST /backtest/run
+  Body: { symbol, fromDate, toDate, params? }
+  Returns: { runId, status: 'queued' }
+
+GET /backtest/runs/:runId
+  Returns: { status, tradeCount, winRate, avgRR, signals[] }
+
+GET /backtest/runs
+  Returns: list of all past runs with summary stats
+```
+
+### How it works
+
+Backtests run as BullMQ background jobs so they never block the NestJS event loop. A 6-month M15 backtest processes ~11,000 candles and may take 5–30 seconds.
+
+```
+POST /backtest/run
+        │
+        ▼
+BacktestController → enqueues BullMQ job → returns { runId }
+        │
+        ▼ (background worker)
+BacktestProcessor:
+  1. Query BarM15 for symbol + date range
+  2. If candle gaps exist → fetch from historical data API → upsert into BarM15 (source = HISTORICAL)
+  3. Replay candles one by one, chronologically:
+     a. AsiaSessionService.onBar(candle)        ← same service as live
+     b. ZoneEngineService.onBar(candle)         ← same service as live
+     c. StrategyService.evaluate(...)           ← same service as live
+     d. SimulatedRiskService.gate(signal, ...)  ← backtest-only: no real positions/commands
+     e. Record BacktestSignal (valid/invalid, entry/SL/TP, simulated outcome)
+  4. Save BacktestRun summary to DB
+```
+
+### The single-codebase principle
+
+`AsiaSessionService`, `ZoneEngineService`, and `StrategyService` are **the same injectable classes** used during live trading. The `BacktestProcessor` injects them directly. There is no separate strategy implementation for backtest.
+
+What changes in backtest mode:
+
+- Data input: DB cursor over `BarM15` rows, not live EA HTTP events
+- Time: driven by bar timestamps, never `Date.now()`
+- Order execution: `SimulatedFillService` fills at next bar's open — no real MT5 commands
+- State: isolated `SimulatedStateService` tracks simulated positions per run — never touches live `Position`/`Order` tables
+
+### No-lookahead rule
+
+The replay cursor must expose exactly one new closed bar per step. Strategy services must never query `BarM15` for rows with `timeOpen > currentBarTime` during a replay. The processor enforces this by passing only the current bar (and pre-fetched prior context) into the service calls.
+
+### Historical data fetching
+
+When the requested date range is not fully covered in `BarM15`, the `HistoricalDataService` fetches the missing candles from the configured external provider (FXCM API, dukascopy-node, or other — provider is injected and swappable). Fetched candles are stored in `BarM15` with `source = 'HISTORICAL'` and reused in future backtest runs for the same symbol/range.
+
+---
+
 ## 10. NestJS Module Structure
 
 ```
@@ -393,6 +490,7 @@ ZonesModule
 
 StrategyModule
   └── S1 / SSA / Mutazione detectors
+  └── (services are reused by BacktestModule)
 
 RiskModule
   └── Decisioning + policies
@@ -405,6 +503,15 @@ AuditModule
 
 ReconciliationModule
   └── Snapshot compare + state healing
+
+BacktestModule
+  └── BacktestController        (POST /backtest/run, GET /backtest/runs)
+  └── BacktestQueue             (BullMQ job queue — uses existing Redis)
+  └── BacktestProcessor         (background worker, drives the replay loop)
+  └── HistoricalDataService     (fetches missing candles from external API, upserts BarM15)
+  └── SimulatedFillService      (simulates order fills at next bar open)
+  └── SimulatedStateService     (isolated position/order state per backtest run)
+  └── BacktestRunRepository     (persists BacktestRun + BacktestSignal records)
 ```
 
 ---

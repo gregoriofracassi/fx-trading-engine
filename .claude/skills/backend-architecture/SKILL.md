@@ -51,6 +51,15 @@ src/
 - Modules never import each other's internal classes. Cross-module calls go through a public service interface or via the EventBus.
 - Cross-module DB references use plain string IDs — no cross-schema joins.
 
+## Service Rules
+
+- Services live in `domain/services/` and are plain `@Injectable()` classes.
+- Use a service when logic is too complex or reusable to live in a single handler, or when a controller needs to call a reusable function directly without going through the command/query bus.
+- Services may be injected into command handlers, query handlers, or controllers within the same module.
+- Services may call repositories and other services within the same module. They must never import from another module's internals — use the EventBus for cross-module communication.
+- Infrastructure-wrapping services (e.g. third-party API clients) may live at the module root (e.g. `apify.service.ts`) rather than in `domain/services/` when they are primarily adapters rather than domain logic.
+- Never put Prisma types or HTTP types inside a service.
+
 ## CQRS Rules
 
 - Every state-mutating operation is a Command. Every read is a Query.
@@ -132,7 +141,7 @@ src/
 
 - Husky + Commitlint enforcing conventional commits: `<type>(<scope>): <description>`.
 - Allowed types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `ci`.
-- pre-commit runs Prettier only. Nothing else.
+- pre-commit runs Prettier on staged files, then `pnpm typecheck` (`tsc --noEmit`) across all packages.
 - E2E tests are not part of any commit or push hook.
 
 ## Deployment Rules
