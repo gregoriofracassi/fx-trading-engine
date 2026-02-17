@@ -22,7 +22,12 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:support.autochartist.com)",
       "WebFetch(domain:hw.online)",
-      "WebFetch(domain:www.metatrader5.com)"
+      "WebFetch(domain:www.metatrader5.com)",
+      "Skill(ea)",
+      "Bash(lsof:*)",
+      "Bash(docker ps:*)",
+      "Bash(docker stop:*)",
+      "Bash(curl:*)"
     ],
     "deny": [],
     "ask": []

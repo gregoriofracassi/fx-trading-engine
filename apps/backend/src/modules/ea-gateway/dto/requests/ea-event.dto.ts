@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsNotEmpty, IsOptional, IsInt, IsDateString } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsInt } from 'class-validator';
 
 export class EaEventDto {
   @ApiProperty({ example: 'HEARTBEAT' })
@@ -19,6 +19,6 @@ export class EaEventDto {
 
   @ApiPropertyOptional({ example: '2026-02-13T10:00:00Z' })
   @IsOptional()
-  @IsDateString()
-  sentAt?: string;
+  @IsString()
+  sentAt?: string; // accepts any string format (MT5 sends non-ISO dates)
 }

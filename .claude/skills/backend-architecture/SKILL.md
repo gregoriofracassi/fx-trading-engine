@@ -146,8 +146,9 @@ src/
 
 ## Deployment Rules
 
-- Multi-stage Dockerfile with pnpm. Stages: base → deps → build → runner.
+- Multi-stage Dockerfile with pnpm. Stages: base → deps → build → runner. Use `pnpm deploy --prod` in the build stage and copy the result to the runner to get a flat, correct node_modules.
 - docker-compose for local and production: backend, frontend, nginx, postgres, redis.
+- **Prisma binaryTargets**: the `schema.prisma` generator must declare `binaryTargets` explicitly. Use `["native", "linux-musl-arm64-openssl-3.0.x"]` for ARM64 hosts (e.g. Apple Silicon dev/local). For x86_64 production servers use `"linux-musl-openssl-3.0.x"` instead. Always add `openssl` via `apk add --no-cache openssl` in the runner stage.
 - Nginx proxies `/api/*` and `/idp/*` to backend:3000, everything else to frontend:80.
 - Frontend is a static bundle — Nginx serves it directly, no Node.js at runtime.
 - Environment variables: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, `JWKS_URI`, `OIDC_COOKIE_KEYS`, `PORT`, `NODE_ENV`, SMTP credentials.

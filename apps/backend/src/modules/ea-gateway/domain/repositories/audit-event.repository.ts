@@ -1,5 +1,4 @@
 import { Injectable } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
 import { PrismaService } from '../../../../database/prisma.service';
 
 interface CreateAuditEventInput {
@@ -21,7 +20,7 @@ export class AuditEventRepository {
         type: input.type,
         sequenceNum: input.sequenceNum,
         sentAt: input.sentAt,
-        payload: input.payload as Prisma.InputJsonValue,
+        payload: input.payload as object,
       },
     });
   }

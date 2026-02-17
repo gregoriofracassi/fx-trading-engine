@@ -8,7 +8,7 @@
 #property strict
 
 //--- Input parameters
-input string BackendBaseUrl  = "http://localhost:3000"; // Backend base URL (no trailing slash)
+input string BackendBaseUrl  = "https://unstationed-joselyn-pantropically.ngrok-free.dev"; // Backend base URL (no trailing slash)
 input string TerminalId      = "FTMO_01";               // Unique ID for this MT5 terminal
 input int    HeartbeatSecs   = 10;                      // Heartbeat interval in seconds
 

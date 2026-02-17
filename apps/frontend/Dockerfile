@@ -13,6 +13,7 @@ RUN pnpm install --frozen-lockfile --filter @job-search/frontend
 FROM deps AS build
 ARG VITE_API_URL
 ENV VITE_API_URL=$VITE_API_URL
+COPY tsconfig.base.json ./
 COPY apps/frontend ./apps/frontend
 RUN pnpm --filter @job-search/frontend run build
 
