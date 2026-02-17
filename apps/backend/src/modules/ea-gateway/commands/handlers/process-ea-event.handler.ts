@@ -10,13 +10,15 @@ export class ProcessEaEventHandler implements ICommandHandler<ProcessEaEventComm
   constructor(private readonly auditEventRepository: AuditEventRepository) {}
 
   async execute(command: ProcessEaEventCommand): Promise<void> {
-    await this.auditEventRepository.create({
-      terminalId: command.terminalId,
-      type: command.type,
-      sequenceNum: command.sequenceNum,
-      sentAt: command.sentAt,
-      payload: command.payload,
-    });
+    if (command.type !== 'HEARTBEAT') {
+      await this.auditEventRepository.create({
+        terminalId: command.terminalId,
+        type: command.type,
+        sequenceNum: command.sequenceNum,
+        sentAt: command.sentAt,
+        payload: command.payload,
+      });
+    }
 
     this.logger.log(`[${command.terminalId}] ${command.type} seq=${command.sequenceNum ?? '-'}`);
   }

@@ -27,7 +27,14 @@
       "Bash(lsof:*)",
       "Bash(docker ps:*)",
       "Bash(docker stop:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Skill(milestones)",
+      "Bash(tree:*)",
+      "Skill(backend-architecture)",
+      "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm --filter @fx-trading/backend exec prisma migrate dev:*)",
+      "Bash(pnpm --filter @fx-trading/backend exec tsc:*)",
+      "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm --filter @fx-trading/backend exec prisma generate:*)",
+      "Bash(pnpm --filter @fx-trading/backend exec prisma:*)"
     ],
     "deny": [],
     "ask": []

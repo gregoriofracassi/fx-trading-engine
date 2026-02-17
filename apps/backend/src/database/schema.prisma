@@ -13,13 +13,32 @@ datasource db {
 // ─── EA Gateway ───────────────────────────────────────────────────────────────
 
 model AuditEvent {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   terminalId  String
   type        String
   sequenceNum Int?
   sentAt      DateTime?
   payload     Json
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
 
+  @@schema("ea_gateway")
+}
+
+model BarM15 {
+  id           String   @id @default(cuid())
+  symbol       String
+  timeOpen     DateTime
+  timeClose    DateTime
+  open         Float
+  high         Float
+  low          Float
+  close        Float
+  tickVolume   Int
+  spreadPoints Int
+  source       String   @default("FTMO_LIVE") // FTMO_LIVE | HISTORICAL
+  createdAt    DateTime @default(now())
+
+  @@unique([symbol, timeOpen])
+  @@index([symbol, timeOpen])
   @@schema("ea_gateway")
 }
