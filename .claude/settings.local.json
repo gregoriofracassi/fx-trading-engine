@@ -40,7 +40,9 @@
       "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm --filter @fx-trading/backend exec prisma migrate:*)",
       "WebFetch(domain:docs.nestjs.com)",
       "Bash(pnpm:*)",
-      "Skill(m3-asia-range)"
+      "Skill(m3-asia-range)",
+      "Bash(npx eslint:*)",
+      "Bash(psql:*)"
     ],
     "deny": [],
     "ask": []

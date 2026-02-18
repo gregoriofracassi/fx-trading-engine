@@ -18,5 +18,6 @@ const Repositories = [AuditEventRepository, BarM15Repository];
   imports: [CqrsModule, DatabaseModule],
   controllers: [EaGatewayController],
   providers: [...CommandHandlers, ...QueryHandlers, ...Services, ...Repositories],
+  exports: [BarM15Repository],
 })
 export class EaGatewayModule {}

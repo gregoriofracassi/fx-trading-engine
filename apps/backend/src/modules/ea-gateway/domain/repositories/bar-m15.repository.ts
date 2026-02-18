@@ -47,4 +47,30 @@ export class BarM15Repository {
     });
     return row ?? null;
   }
+
+  async findAllBySymbol(symbol: string): Promise<
+    {
+      symbol: string;
+      timeOpen: Date;
+      timeClose: Date;
+      open: number;
+      high: number;
+      low: number;
+      close: number;
+    }[]
+  > {
+    return this.prisma.barM15.findMany({
+      where: { symbol },
+      orderBy: { timeOpen: 'asc' },
+      select: {
+        symbol: true,
+        timeOpen: true,
+        timeClose: true,
+        open: true,
+        high: true,
+        low: true,
+        close: true,
+      },
+    });
+  }
 }

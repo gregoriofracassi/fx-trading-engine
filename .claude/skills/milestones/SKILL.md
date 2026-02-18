@@ -69,7 +69,7 @@ description: Development milestones plan for the FX trading engine. Covers 10 mi
 
 ---
 
-## Milestone 3 — Asia Range (Calculation Only, No Trading) ← CURRENT
+## Milestone 3 — Asia Range (Calculation Only, No Trading) ✅
 
 **Goal:** Calculate and persist the Asia Session high/low for each trading day. This is the foundational input for every setup (S1, SSA, Mutazione).
 
@@ -94,7 +94,7 @@ description: Development milestones plan for the FX trading engine. Covers 10 mi
 
 ---
 
-## Milestone 4 — S1 Detector "Read-Only" (Signal Records, No Orders)
+## Milestone 4 — S1 Detector "Read-Only" (Signal Records, No Orders) ← CURRENT
 
 **Goal:** Implement S1 signal detection and write `Signal` records to DB — no order placement.
 
