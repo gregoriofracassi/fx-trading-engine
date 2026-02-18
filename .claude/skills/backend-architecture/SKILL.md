@@ -58,7 +58,8 @@ src/
 - Services may be injected into command handlers, query handlers, or controllers within the same module.
 - Services may call repositories and other services within the same module. They must never import from another module's internals — use the EventBus for cross-module communication.
 - Infrastructure-wrapping services (e.g. third-party API clients) may live at the module root (e.g. `apify.service.ts`) rather than in `domain/services/` when they are primarily adapters rather than domain logic.
-- Never put Prisma types or HTTP types inside a service.
+- **Never put Prisma types, HTTP types, or HTTP exceptions inside a service.** A service must not throw `BadRequestException`, `NotFoundException`, or any `HttpException` subclass. Those are HTTP-layer concerns. Services throw domain exceptions (from `exceptions/`) or plain `Error`s. The `ApplicationExceptionFilter` maps them to HTTP responses.
+- **Never put input validation in a service.** Validation of incoming request shape (required fields, types, formats) belongs in the DTO layer via `class-validator` decorators. If a service is checking `if (!dto.symbol) throw new BadRequestException(...)`, that logic should be a `@ValidateIf()` on the DTO instead.
 
 ## CQRS Rules
 
@@ -85,10 +86,15 @@ src/
 
 ## Database Rules
 
-- Single PostgreSQL instance. One schema per module using Prisma `multiSchema` preview feature.
-- Every model and enum declares `@@schema("module_name")`.
-- No cross-schema foreign keys. Reference other modules by storing their ID as a plain string.
-- Run migrations with `pnpm prisma migrate dev`, generate client with `pnpm prisma generate`.
+- Single PostgreSQL instance. Multiple Postgres schemas using Prisma `multiSchema` preview feature — one schema per domain area, not per module.
+- Every model declares `@@schema("schema_name")`. Current schemas:
+  - `ea_gateway` — raw ingestion data: `AuditEvent`, `BarM15`
+  - `strategy` — strategy computation data: `AsiaRange`, future `Signal`, `Zone` etc.
+- Adding a new schema: add it to `schemas = [...]` in the datasource block, add `@@schema("name")` to the model, run a migration.
+- No cross-schema foreign keys. Reference across schemas by storing the ID as a plain string.
+- No redundant `@@index` alongside `@@unique` on the same columns — `@@unique` already creates a B-tree index in Postgres.
+- Run migrations: `DATABASE_URL=... pnpm --filter @fx-trading/backend exec prisma migrate dev --name <name> --schema=src/database/schema.prisma`
+- Generate client: `DATABASE_URL=... pnpm --filter @fx-trading/backend exec prisma generate --schema=src/database/schema.prisma`
 
 ## Events Rules
 
@@ -129,7 +135,52 @@ src/
 
 - Request DTOs use `class-validator` decorators and `@ApiProperty()` for every field.
 - Response DTOs are plain classes or interfaces — never return raw domain models or Prisma records from controllers.
-- Register globally: `ValidationPipe({ whitelist: true, transform: true })`.
+- Register globally: `ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: true })`.
+- **`@ValidateIf(o => condition)` for conditional required fields.** When a field is required only for a specific event type or request variant, use `@ValidateIf()` instead of `@IsOptional()`. This keeps the validation contract in the DTO where it belongs, not in the controller or service.
+
+  ```typescript
+  const isBarEvent = (o: EaEventDto) => o.type === 'BAR_M15_CLOSED';
+
+  @ValidateIf(isBarEvent)
+  @IsString()
+  symbol?: string;
+  ```
+
+- **`@Transform` for format conversion at the boundary.** If the incoming value needs to be normalised before validation (e.g. a custom date format, a trimmed string, a stringified number), use a `@Transform` decorator — or a reusable custom decorator wrapping it — on the DTO field. This runs during `plainToInstance()` before validators fire. Never do this conversion in the controller or handler.
+
+  ```typescript
+  // common/decorators/parse-mt5-date.decorator.ts
+  export function ParseMT5Date() {
+    return Transform(({ value }) => value != null ? parseMT5Date(value) : value);
+  }
+
+  // in DTO:
+  @ParseMT5Date()
+  @IsDate()
+  timeOpen?: Date;
+  ```
+
+- **Reusable transform decorators live in `src/common/decorators/`.** Do not inline `@Transform` logic in a DTO if the same transformation is needed in more than one place.
+- **Utility functions live in `src/common/utils/`.** Pure functions with no NestJS dependency (e.g. date parsing, string normalisation) live here as plain exported functions. They are imported by decorators, handlers, or services as needed — never defined inside a repository or controller.
+
+## Separation of Concerns — Quick Reference
+
+Each layer has exactly one job. When in doubt, use this table:
+
+| Concern                                     | Where it lives                                               | What it must NOT do                         |
+| ------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------- |
+| Input shape & format validation             | DTO (`class-validator`, `@ValidateIf`, `@Transform`)         | Business logic, DB access                   |
+| Input format conversion (e.g. date parsing) | `@Transform` decorator in DTO, backed by `src/common/utils/` | Throw HTTP exceptions                       |
+| Route handling, response shaping            | Controller                                                   | Validation logic, business logic, DB access |
+| Business / domain logic                     | Service (`domain/services/`)                                 | Throw HTTP exceptions, import Prisma types  |
+| DB access                                   | Repository (`domain/repositories/`)                          | Business logic, date parsing, HTTP concerns |
+| Cross-cutting utilities (pure functions)    | `src/common/utils/`                                          | NestJS dependencies, side effects           |
+| Reusable decorator factories                | `src/common/decorators/`                                     | Business logic                              |
+| HTTP→domain exception mapping               | `ApplicationExceptionFilter`                                 | Domain logic                                |
+
+**Guards** are for _authorization_ ("is this caller allowed?") — not input validation.
+**Interceptors** are for cross-cutting response transformation (logging, serialisation) — not business logic.
+**Pipes** are for per-parameter transformation/validation when a global `ValidationPipe` is insufficient — rarely needed.
 
 ## Testing Rules
 

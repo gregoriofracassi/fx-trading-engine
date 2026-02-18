@@ -1,23 +1,20 @@
 //+------------------------------------------------------------------+
 //| HeartbeatEA.mq5                                                  |
 //| Milestone 1+2 — EA connectivity + M15 bar close ingestion        |
-//| Sends HEARTBEAT every N seconds and BAR_M15_CLOSED on bar close. |
-//| On startup: fetches last known bar from backend and backfills     |
-//| any missing bars since that point.                               |
+//| On every bar close: asks backend for its last known bar,         |
+//| then sends all missing closed bars in a single batch POST.       |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.01"
+#property version   "1.03"
 #property strict
 
 //--- Input parameters
-input string BackendBaseUrl  = "https://unstationed-joselyn-pantropically.ngrok-free.dev"; // Backend base URL (no trailing slash)
-input string TerminalId      = "FTMO_01";               // Unique ID for this MT5 terminal
-input int    HeartbeatSecs   = 30;                      // Heartbeat interval in seconds
+input string BackendBaseUrl = "https://unstationed-joselyn-pantropically.ngrok-free.dev"; // Backend base URL (no trailing slash)
+input string TerminalId     = "FTMO_01"; // Unique ID for this MT5 terminal
 
-//--- Internal state
+//--- Internal state (dedup only — not source of truth)
 int      sequenceNumber    = 0;
 datetime lastClosedBarTime = 0;
-datetime lastHeartbeatTime = 0;
 
 //+------------------------------------------------------------------+
 //| OnInit                                                           |
@@ -26,10 +23,6 @@ int OnInit()
 {
    EventSetTimer(1); // fire every 1 second
    Print("HeartbeatEA started | TerminalId=", TerminalId, " | Backend=", BackendBaseUrl);
-
-   //--- Backfill missing bars on startup
-   BackfillMissingBars();
-
    return(INIT_SUCCEEDED);
 }
 
@@ -47,14 +40,6 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   //--- Heartbeat (every HeartbeatSecs)
-   if(TimeCurrent() - lastHeartbeatTime >= HeartbeatSecs)
-   {
-      SendHeartbeat();
-      lastHeartbeatTime = TimeCurrent();
-   }
-
-   //--- M15 bar close detector
    CheckBarClose();
 }
 
@@ -64,23 +49,45 @@ void OnTimer()
 void OnTick() {}
 
 //+------------------------------------------------------------------+
+//| CheckBarClose                                                    |
+//| Dedup gate: detects a new closed bar, then delegates entirely    |
+//| to BackfillMissingBars which is the single send path.           |
+//+------------------------------------------------------------------+
+void CheckBarClose()
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+
+   if(CopyRates(Symbol(), PERIOD_M15, 0, 2, rates) < 2)
+      return;
+
+   datetime closedBarTime = rates[1].time; // rates[1] = last closed bar
+
+   if(closedBarTime <= lastClosedBarTime)
+      return; // no new bar
+
+   lastClosedBarTime = closedBarTime; // update dedup gate
+
+   BackfillMissingBars();
+}
+
+//+------------------------------------------------------------------+
 //| BackfillMissingBars                                              |
-//| Called once on OnInit. Asks backend for its last known bar,      |
-//| then sends every bar from that point up to (but not including)   |
-//| the currently open bar.                                          |
+//| Single send path. Asks backend for its last known bar, builds    |
+//| a JSON array of every missing closed bar, sends in one POST.    |
+//| Handles: startup, reconnect, and normal bar close identically.  |
 //+------------------------------------------------------------------+
 void BackfillMissingBars()
 {
    //--- 1. Ask backend for last known bar timeOpen (ISO 8601 string or "null")
    string lastKnownIso = QueryLastBar(Symbol());
 
-   datetime fromTime;
+   datetime fromTime = 0;
 
    if(lastKnownIso == "" || lastKnownIso == "null")
    {
-      //--- No data in backend yet — send last 200 closed bars as initial seed
-      Print("Backfill: no data in backend, seeding last 200 bars for ", Symbol());
-      fromTime = 0; // will be clamped by available history below
+      Print("Backfill: no data in backend, seeding last 500 bars for ", Symbol());
+      fromTime = 0;
    }
    else
    {
@@ -89,8 +96,7 @@ void BackfillMissingBars()
       StringReplace(mt5fmt, "-", ".");
       StringReplace(mt5fmt, "T", " ");
       int dotPos = StringFind(mt5fmt, ".");
-      // strip milliseconds and Z if present: "2026.02.17 19:15:00.000Z" → "2026.02.17 19:15:00"
-      int msPos = StringFind(mt5fmt, ".", dotPos + 9); // look for ms dot after time part
+      int msPos  = StringFind(mt5fmt, ".", dotPos + 9);
       if(msPos > 0)
          mt5fmt = StringSubstr(mt5fmt, 0, msPos);
       StringReplace(mt5fmt, "Z", "");
@@ -98,15 +104,13 @@ void BackfillMissingBars()
       fromTime = StringToTime(mt5fmt);
       Print("Backfill: last known bar in backend = ", mt5fmt, " (", (long)fromTime, ")");
 
-      //--- The bar at fromTime is already in the backend, so start from the next one
-      fromTime += 900; // +15 minutes
+      fromTime += 900; // already have that bar, start from next
    }
 
-   //--- 2. Load available M15 history
+   //--- 2. Load available M15 history (chronological, oldest first)
    MqlRates rates[];
-   ArraySetAsSeries(rates, false); // chronological order (oldest first)
+   ArraySetAsSeries(rates, false);
 
-   //--- We want up to 500 bars to cover any downtime gap
    int copied = CopyRates(Symbol(), PERIOD_M15, 0, 500, rates);
    if(copied <= 0)
    {
@@ -114,8 +118,8 @@ void BackfillMissingBars()
       return;
    }
 
-   //--- rates[copied-1] is the currently OPEN bar — skip it
-   //--- rates[copied-2] is the last CLOSED bar
+   //--- 3. Collect missing closed bars (skip currently open bar at rates[copied-1])
+   string items = "";
    int sentCount = 0;
 
    for(int i = 0; i < copied - 1; i++)
@@ -123,22 +127,21 @@ void BackfillMissingBars()
       if(fromTime > 0 && rates[i].time < fromTime)
          continue; // already in backend
 
-      //--- Send this closed bar
       string timeOpen  = TimeToString(rates[i].time,       TIME_DATE | TIME_SECONDS);
       string timeClose = TimeToString(rates[i].time + 900, TIME_DATE | TIME_SECONDS);
 
       sequenceNumber++;
 
-      string body = StringFormat(
+      string item = StringFormat(
          "{\"type\":\"BAR_M15_CLOSED\","
          "\"terminalId\":\"%s\","
          "\"symbol\":\"%s\","
          "\"timeOpen\":\"%s\","
          "\"timeClose\":\"%s\","
-         "\"o\":%.5f,"
-         "\"h\":%.5f,"
-         "\"l\":%.5f,"
-         "\"c\":%.5f,"
+         "\"open\":%.5f,"
+         "\"high\":%.5f,"
+         "\"low\":%.5f,"
+         "\"close\":%.5f,"
          "\"tickVolume\":%d,"
          "\"spreadPoints\":%d,"
          "\"sentAt\":\"%s\","
@@ -157,31 +160,36 @@ void BackfillMissingBars()
          sequenceNumber
       );
 
-      int status = SendPost(body);
-      Print("Backfill | ", Symbol(), " | timeOpen=", timeOpen, " | HTTP=", status);
+      if(sentCount > 0)
+         items += ",";
+      items += item;
       sentCount++;
-
-      //--- Small delay to avoid flooding backend (5 ms)
-      Sleep(5);
    }
 
-   //--- Update lastClosedBarTime so CheckBarClose doesn't re-send bars we just backfilled
-   if(copied >= 2)
-      lastClosedBarTime = rates[copied - 2].time;
+   if(sentCount == 0)
+   {
+      Print("Backfill: nothing to send, backend is up to date");
+      return;
+   }
 
-   Print("Backfill complete | sent=", sentCount, " bars | symbol=", Symbol());
+   //--- 4. Send single batch POST
+   string body   = "[" + items + "]";
+   int    status = SendPost(body);
+
+   Print("Backfill | ", Symbol(), " | sent=", sentCount, " bars | HTTP=", status);
 }
 
 //+------------------------------------------------------------------+
 //| QueryLastBar                                                     |
 //| GET /api/ea/last-bar?symbol=EURUSD                               |
-//| Returns the timeOpen ISO string or "null" if no data             |
+//| Returns the timeOpen ISO string, "null" if no data, or ""       |
+//| on network error.                                                |
 //+------------------------------------------------------------------+
 string QueryLastBar(string symbol)
 {
    string url = BackendBaseUrl + "/api/ea/last-bar?symbol=" + symbol;
    string reqHeaders = "";
-   char   postData[];  // empty body for GET
+   char   postData[];
    char   result[];
    string resultHeaders;
 
@@ -189,8 +197,7 @@ string QueryLastBar(string symbol)
 
    if(status == -1)
    {
-      int err = GetLastError();
-      Print("QueryLastBar: WebRequest FAILED | error=", err);
+      Print("QueryLastBar: WebRequest FAILED | error=", GetLastError());
       return "";
    }
 
@@ -200,12 +207,9 @@ string QueryLastBar(string symbol)
       return "";
    }
 
-   //--- Parse {"symbol":"EURUSD","timeOpen":"2026-02-17T19:15:00.000Z"}
-   //--- or    {"symbol":"EURUSD","timeOpen":null}
    string responseStr = CharArrayToString(result);
    Print("QueryLastBar raw response: ", responseStr);
 
-   //--- Extract value after "timeOpen":
    string key = "\"timeOpen\":";
    int keyPos = StringFind(responseStr, key);
    if(keyPos < 0)
@@ -214,14 +218,12 @@ string QueryLastBar(string symbol)
       return "";
    }
 
-   int valueStart = keyPos + StringLen(key);
-   string rest = StringSubstr(responseStr, valueStart);
+   int    valueStart = keyPos + StringLen(key);
+   string rest       = StringSubstr(responseStr, valueStart);
 
-   //--- Check for null
    if(StringSubstr(rest, 0, 4) == "null")
       return "null";
 
-   //--- Extract quoted string: "2026-02-17T19:15:00.000Z"
    if(StringSubstr(rest, 0, 1) == "\"")
    {
       int closeQuote = StringFind(rest, "\"", 1);
@@ -230,89 +232,6 @@ string QueryLastBar(string symbol)
    }
 
    return "";
-}
-
-//+------------------------------------------------------------------+
-//| CheckBarClose — detects new closed M15 bar and sends it         |
-//+------------------------------------------------------------------+
-void CheckBarClose()
-{
-   MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-
-   if(CopyRates(Symbol(), PERIOD_M15, 0, 2, rates) < 2)
-      return;
-
-   datetime closedBarTime = rates[1].time; // rates[1] = last closed bar
-
-   if(closedBarTime <= lastClosedBarTime)
-      return; // already sent this bar
-
-   lastClosedBarTime = closedBarTime;
-
-   //--- Build time strings (MT5 format: "2026.02.17 15:00:00")
-   string timeOpen  = TimeToString(rates[1].time,       TIME_DATE | TIME_SECONDS);
-   string timeClose = TimeToString(rates[1].time + 900, TIME_DATE | TIME_SECONDS); // +15 min
-
-   sequenceNumber++;
-
-   string body = StringFormat(
-      "{\"type\":\"BAR_M15_CLOSED\","
-      "\"terminalId\":\"%s\","
-      "\"symbol\":\"%s\","
-      "\"timeOpen\":\"%s\","
-      "\"timeClose\":\"%s\","
-      "\"o\":%.5f,"
-      "\"h\":%.5f,"
-      "\"l\":%.5f,"
-      "\"c\":%.5f,"
-      "\"tickVolume\":%d,"
-      "\"spreadPoints\":%d,"
-      "\"sentAt\":\"%s\","
-      "\"seq\":%d}",
-      TerminalId,
-      Symbol(),
-      timeOpen,
-      timeClose,
-      rates[1].open,
-      rates[1].high,
-      rates[1].low,
-      rates[1].close,
-      (int)rates[1].tick_volume,
-      (int)rates[1].spread,
-      TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS),
-      sequenceNumber
-   );
-
-   int status = SendPost(body);
-   Print("BarSent | ", Symbol(), " | timeOpen=", timeOpen, " | HTTP=", status);
-}
-
-//+------------------------------------------------------------------+
-//| SendHeartbeat                                                     |
-//+------------------------------------------------------------------+
-void SendHeartbeat()
-{
-   sequenceNumber++;
-
-   string body = StringFormat(
-      "{\"type\":\"HEARTBEAT\",\"terminalId\":\"%s\",\"sentAt\":\"%s\",\"seq\":%d}",
-      TerminalId,
-      TimeToString(TimeGMT(), TIME_DATE | TIME_SECONDS),
-      sequenceNumber
-   );
-
-   int status = SendPost(body);
-   if(status == -1)
-   {
-      int err = GetLastError();
-      Print("HeartbeatEA: WebRequest FAILED | error=", err,
-            " | HINT: Add ", BackendBaseUrl, " to Tools > Options > Expert Advisors > Allow WebRequest");
-   }
-   else
-   {
-      Print("HeartbeatEA: Heartbeat sent | seq=", sequenceNumber, " | HTTP=", status);
-   }
 }
 
 //+------------------------------------------------------------------+

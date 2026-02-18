@@ -7,7 +7,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
-  schemas  = ["ea_gateway"]
+  schemas  = ["ea_gateway", "strategy"]
 }
 
 // ─── EA Gateway ───────────────────────────────────────────────────────────────
@@ -22,6 +22,22 @@ model AuditEvent {
   createdAt   DateTime  @default(now())
 
   @@schema("ea_gateway")
+}
+
+// ─── Strategy ─────────────────────────────────────────────────────────────────
+
+model AsiaRange {
+  id        String   @id @default(cuid())
+  date      String   // Rome calendar date "YYYY-MM-DD" — plain string avoids timezone ambiguity
+  symbol    String
+  high      Float
+  low       Float
+  finalized Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([date, symbol])
+  @@schema("strategy")
 }
 
 model BarM15 {
@@ -39,6 +55,5 @@ model BarM15 {
   createdAt    DateTime @default(now())
 
   @@unique([symbol, timeOpen])
-  @@index([symbol, timeOpen])
   @@schema("ea_gateway")
 }

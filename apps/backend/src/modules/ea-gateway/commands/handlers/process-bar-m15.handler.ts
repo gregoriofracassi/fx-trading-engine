@@ -1,8 +1,9 @@
-import { CommandHandler, ICommandHandler } from '@nestjs/cqrs';
+import { CommandHandler, ICommandHandler, EventBus } from '@nestjs/cqrs';
 import { Logger } from '@nestjs/common';
 import { ProcessBarM15Command } from '../impl/process-bar-m15.command';
 import { BarM15Repository } from '../../domain/repositories/bar-m15.repository';
 import { AuditEventRepository } from '../../domain/repositories/audit-event.repository';
+import { BarM15ClosedEvent } from '../../events/bar-m15-closed.event';
 
 @CommandHandler(ProcessBarM15Command)
 export class ProcessBarM15Handler implements ICommandHandler<ProcessBarM15Command> {
@@ -11,6 +12,7 @@ export class ProcessBarM15Handler implements ICommandHandler<ProcessBarM15Comman
   constructor(
     private readonly barM15Repository: BarM15Repository,
     private readonly auditEventRepository: AuditEventRepository,
+    private readonly eventBus: EventBus,
   ) {}
 
   async execute(command: ProcessBarM15Command): Promise<void> {
@@ -44,6 +46,18 @@ export class ProcessBarM15Handler implements ICommandHandler<ProcessBarM15Comman
         spreadPoints: command.spreadPoints,
       },
     });
+
+    this.eventBus.publish(
+      new BarM15ClosedEvent(
+        command.symbol,
+        command.timeOpen,
+        command.timeClose,
+        command.open,
+        command.high,
+        command.low,
+        command.close,
+      ),
+    );
 
     this.logger.log(
       `[${command.terminalId}] BAR_M15_CLOSED | ${command.symbol} | timeOpen=${command.timeOpen.toISOString()} | seq=${command.seq ?? '-'}`,

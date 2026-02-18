@@ -34,7 +34,13 @@
       "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm --filter @fx-trading/backend exec prisma migrate dev:*)",
       "Bash(pnpm --filter @fx-trading/backend exec tsc:*)",
       "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm --filter @fx-trading/backend exec prisma generate:*)",
-      "Bash(pnpm --filter @fx-trading/backend exec prisma:*)"
+      "Bash(pnpm --filter @fx-trading/backend exec prisma:*)",
+      "Skill(fx-strategy)",
+      "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm:*)",
+      "Bash(DATABASE_URL=\"postgresql://postgres:postgres@localhost:5432/fx_trading\" pnpm --filter @fx-trading/backend exec prisma migrate:*)",
+      "WebFetch(domain:docs.nestjs.com)",
+      "Bash(pnpm:*)",
+      "Skill(m3-asia-range)"
     ],
     "deny": [],
     "ask": []

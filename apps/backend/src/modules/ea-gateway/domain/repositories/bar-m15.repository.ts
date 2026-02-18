@@ -14,11 +14,6 @@ export interface UpsertBarM15Input {
   source: string;
 }
 
-function parseMT5Date(raw: string): Date {
-  const iso = raw.replace(/(\d{4})\.(\d{2})\.(\d{2})/, '$1-$2-$3').replace(' ', 'T');
-  return new Date(iso + 'Z'); // treat as UTC
-}
-
 @Injectable()
 export class BarM15Repository {
   constructor(private readonly prisma: PrismaService) {}
@@ -51,9 +46,5 @@ export class BarM15Repository {
       select: { timeOpen: true },
     });
     return row ?? null;
-  }
-
-  static parseMT5Date(raw: string): Date {
-    return parseMT5Date(raw);
   }
 }
