@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { BarM15 } from '@prisma/client';
 import { PrismaService } from '../../../../database/prisma.service';
 
 export interface UpsertBarM15Input {
@@ -72,5 +73,24 @@ export class BarM15Repository {
         close: true,
       },
     });
+  }
+
+  /**
+   * Find the most recent N bars before (and including) a given time.
+   * Returns bars in chronological order (oldest first).
+   * Used by S1DetectorService to analyze recent patterns.
+   */
+  async findRecentBars(symbol: string, beforeTime: Date, limit: number): Promise<BarM15[]> {
+    const bars = await this.prisma.barM15.findMany({
+      where: {
+        symbol,
+        timeClose: { lte: beforeTime },
+      },
+      orderBy: { timeClose: 'desc' },
+      take: limit,
+    });
+
+    // Reverse to return chronological order (oldest first)
+    return bars.reverse();
   }
 }

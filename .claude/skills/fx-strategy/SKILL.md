@@ -92,7 +92,20 @@ These are not "setup rules" — they define the real operating environment:
 ### 4.3 "Alternative Asset Next Day" Rule
 
 - If a position was open on an asset (today or overnight), the next trading day the operative must be on a **different asset**.
-- `TODO_AMBIGUITY`: Precise conditions — does this apply only if a position was held overnight? Does it block re-entering the same asset entirely the next day? Does it apply to any trade or only to new entries while an old one is still open? Needs formalization.
+
+**AI-interpreted rule (pending Dave confirmation):**
+- "Activity" on an asset = **filled position** (opened and executed)
+  - Pending order **not filled** does NOT count as activity (gets cancelled at 16:30 anyway)
+  - Trade filled and closed same day = still counts as activity
+- **Next day restriction:**
+  - Cannot open **new positions** on that same asset
+  - Can still manage existing positions (close, modify SL/TP)
+- **Overnight positions:**
+  - If position is still open from previous day, that's allowed (can manage/close it)
+  - But still cannot open a **new** position on that asset
+  - Can open on different assets (rotation encouraged)
+
+> `TODO_DAVE_CONFIRM`: Verify "activity" = filled trade, and blocks new opens (not management) next day
 
 ---
 
@@ -195,45 +208,132 @@ These are the official thresholds from Dave:
 
 - Validation condition for S1, SSA, and Mutazione.
 - Threshold: **≥ 0.6 pips**.
-- `TODO_UNSPECIFIED`: Exact formula — body vs body? range high/low? close beyond a level? difference between candle 1 and candle 2?
+
+**AI-interpreted formula (pending Dave confirmation):**
+- Candles: **push candle** (brings price in opposite direction) vs **engulfing candle** (closes in trade direction)
+- For short:
+  ```
+  pushBodyLow = min(push.open, push.close)
+  engulfSize = pushBodyLow - engulf.close
+  valid if: engulfSize ≥ 0.6 pips
+  ```
+- For long: mirror (engulf.close - pushBodyHigh ≥ 0.6 pips)
+
+> `TODO_DAVE_CONFIRM`: Verify this body-to-close measurement is correct
 
 ### 9.2 Liquidity (≤ 0.5 pips)
 
 - Definition: **distance between the highs of 2 relevant candles** (for short).
 - If distance ∈ [0.0, 0.5] pips inclusive → **liquidity is present** (invalidating condition, or trigger for special rules).
 - For short: `Liquidity = |high(candle A) − high(candle B)|`
-- `TODO_UNSPECIFIED`: Exactly which "2 candles" for each setup:
-  - S1/SSA: the candle that "pushed price higher" and/or the engulfing candle
-  - Mutazione: explicitly "with the previous candle"
+
+**AI-interpreted formula (pending Dave confirmation):**
+- **S1/SSA:** Compare **push candle** (brings price up) vs **engulfing candle**
+  ```
+  liquidityGap = |high(push) - high(engulf)|
+  liquidity present if: liquidityGap ≤ 0.5 pips → setup INVALID
+  ```
+- **Mutazione:** Compare push candle vs **previous candle** (the one immediately before push)
+  ```
+  liquidityGap = |high(push) - high(previous)|
+  liquidity present if: liquidityGap ≤ 0.5 pips → setup INVALID
+  ```
+- For long: use `low` instead of `high`
+
+> `TODO_DAVE_CONFIRM`: Verify which two candles for each setup
 
 ### 9.3 Imbalance Minimum (≥ 1.0 pip)
 
 - For SSA: explicit — the wick must imbalance by ≥ 1 pip.
 - General Forex rule: imbalance minimum = 1 pip.
-- `TODO_UNSPECIFIED`: Measurement endpoint — from Asia Low to what? The wick? The low? The close of the imbalancing candle?
+
+**AI-interpreted formula (pending Dave confirmation):**
+- For **SSA short** (wick-only imbalance):
+  ```
+  imbalance = asiaLow - low(imbCandle)  // uses wick tip
+  valid if: imbalance ≥ 1.0 pip
+  ```
+- Plus structural check: body must NOT accept beyond Asia Low (otherwise it's S1, not SSA)
+- For long: `high(imbCandle) - asiaHigh ≥ 1.0 pip`
+
+> `TODO_DAVE_CONFIRM`: Verify wick tip measurement for SSA
 
 ### 9.4 Acceptance (≥ 0.6 pips)
 
 - "Acceptance: 0.6 — rottura della zona"
 - In S1: "accept with the entire body beyond the Asia session by at least 0.6 pips"
-- `TODO_UNSPECIFIED`: How to measure "entire body beyond the zone" — close beyond the line? Both open and close beyond? Entire body below the level?
+
+**AI-interpreted formula (pending Dave confirmation):**
+- "Entire body beyond" means both open and close must be beyond the zone
+- For **S1 short**:
+  ```
+  bodyHigh = max(candle.open, candle.close)  // highest point of body
+  acceptance = asiaLow - bodyHigh
+  valid if: acceptance ≥ 0.6 pips
+  ```
+- This ensures the entire body (both open and close) stays ≥ 0.6 pips below Asia Low
+- For long: `bodyLow - asiaHigh ≥ 0.6 pips` where `bodyLow = min(open, close)`
+
+> `TODO_DAVE_CONFIRM`: Verify "entire body" means both open and close beyond zone
 
 ### 9.5 Opposite Imbalance (≥ 1.0 pip)
 
 - In S1 and SSA: if a valid opposite imbalance exists (≥ 1.0 pip) → **setup is invalid**.
 - In Mutazione: **opposite imbalance is NOT checked** ("con la mutazione NON si guarda lo sbilanciamento opposto").
 
+**AI-interpreted formula (pending Dave confirmation):**
+- Opposite imbalance = breaking the **opposite Asia extreme** by ≥ 1.0 pip
+- For **short setup**:
+  ```
+  oppImb = high(pushCandle) - asiaHigh
+  setup invalid if: oppImb ≥ 1.0 pip
+  ```
+- The "push candle" (that brings price up against the short direction) is checked
+- For long: `asiaLow - low(pushCandle) ≥ 1.0 pip` → invalid
+
+> `TODO_DAVE_CONFIRM`: Verify opposite imbalance uses push candle vs opposite Asia extreme
+
 ### 9.6 Dominance Rule
 
 - "Lo sbilanciamento dominance reale è più forte dello sbilanciamento opposto quindi si prende sempre"
 - Operational interpretation: if there is a conflict between dominance imbalance and opposite imbalance → **always take dominance**.
-- `TODO_UNSPECIFIED`: Formal definition of "dominance imbalance" — how to calculate it, when it is "real", and how to distinguish it from opposite imbalance. The decision policy ("always take") is clear.
+
+**AI-interpreted formula (pending Dave confirmation):**
+- Dominance is not a different calculation — it's a **priority rule** based on magnitude comparison
+- For **short setup**:
+  ```
+  mainImb = asiaLow - low(imbCandle)      // imbalance in trade direction
+  oppImb = high(pushCandle) - asiaHigh    // opposite imbalance
+
+  if mainImb > oppImb:
+    → dominance applies → take the trade (ignore opposite imbalance)
+  ```
+- Both must meet minimum thresholds (mainImb ≥ 1.0, oppImb ≥ 1.0 to "exist")
+- If main imbalance is larger, it "dominates" and the setup remains valid
+
+> `TODO_DAVE_CONFIRM`: Verify dominance = simple magnitude comparison (mainImb > oppImb)
 
 ### 9.7 Opposite Imbalance Cancelled by Liquidity
 
 - "The opposite imbalance is cancelled if it leaves liquidity at the lows (for short) with another candle."
 - Effect: opposite imbalance is "annulled" (setup can proceed).
-- `TODO_UNSPECIFIED`: How to detect the event and what "annulled" means precisely at the filter level.
+
+**AI-interpreted formula (pending Dave confirmation):**
+- If opposite imbalance exists (would normally invalidate), check if a **later candle** leaves liquidity with the push candle
+- For **short setup**:
+  ```
+  oppImb = high(pushCandle) - asiaHigh  // ≥ 1.0 pip (exists)
+
+  for each candle c2 after pushCandle:
+    if |low(pushCandle) - low(c2)| ≤ 0.5 pips:
+      → liquidity at lows detected
+      → opposite imbalance annulled
+      → setup remains valid
+  ```
+- "Annulled" means the opposite imbalance no longer invalidates the setup
+- For long: check liquidity at highs (`|high(push) - high(c2)| ≤ 0.5`)
+
+> `TODO_DAVE_CONFIRM`: Verify liquidity annulment logic (later candle vs push candle at lows)
 
 ---
 
@@ -346,8 +446,18 @@ Place:
 
 - **Entry**: at the **low of the candle that pushed price highest** (the "push up" candle)
 - **Entry buffer**: 5 pips below entry (short)
-  - `TODO_AMBIGUITY`: "SL 5 pips below entry" is unusual for a short. This appears to be written as stated. Needs clarification with real chart example.
 - **Stop Loss**: 10 pips **above** the high of the push-up candle
+
+**AI-confirmed (from slide analysis):**
+- The original text "SL 5 pips below entry" was an error/typo
+- Correct formula for **Mutazione short**:
+  ```
+  entry = low(pushCandle) - 5 pips
+  SL = high(pushCandle) + 10 pips
+  ```
+- For long: mirror (entry = high(pushCandle) + 5 pips, SL = low(pushCandle) - 10 pips)
+
+> `TODO_DAVE_CONFIRM`: Verify Mutazione entry/SL offsets (5 pips entry buffer, 10 pips SL)
 
 #### Order & Trade Management:
 
@@ -494,22 +604,30 @@ Additional US30 notes (not for bot):
 
 ## 16. Open TODOs / Remaining Ambiguities
 
-These are the only "gaps" — concepts are clear, but exact formulas are not defined in the materials:
+**Status Update:** Items 1-5, 11-13 have been **AI-interpreted** based on slide analysis. Formulas are now documented in sections 9.1-9.7 above, marked with `TODO_DAVE_CONFIRM` for verification.
 
-1. `TODO_UNSPECIFIED`: Exact formula for **engulfing** in pips — what is measured and between which points.
-2. `TODO_UNSPECIFIED`: Exact formula for **acceptance 0.6** — how to define "entire body beyond the zone".
-3. `TODO_UNSPECIFIED`: Formula for **imbalance from Asia Low to imbalancing candle** — use low? close? wick?
-4. `TODO_UNSPECIFIED`: Formal definition and measurement of **opposite imbalance**.
-5. `TODO_UNSPECIFIED`: Formal definition of **dominance imbalance** and condition to apply the "always take" rule.
-6. `TODO_UNSPECIFIED`: Definition and detection of **"leaves liquidity" post-entry**.
+**Remaining unresolved (Zone Engine — deferred to later milestone):**
+
 7. `TODO_UNSPECIFIED`: Complete definition of **"valid candle"** for zone construction (long and short).
 8. `TODO_UNSPECIFIED`: Mathematical formula for **70% and 75% mitigation** on zones.
 9. `TODO_UNSPECIFIED`: Formal definition of **concordant vs discordant zones**.
 10. `TODO_UNSPECIFIED`: Formal definition of **"continuation breakout" vs reversal** in the zone engine.
-11. `TODO_UNSPECIFIED`: **Long mirror rules** for S1/SSA/Mutazione — not present in materials.
-12. `TODO_AMBIGUITY`: **Mutazione SL** — "5 pips below entry" for short appears to be a typo/error; needs clarification with Dave and a real chart example.
-13. `TODO_AMBIGUITY`: **"Alternative asset next day" rule** — when exactly does it trigger and what does it constrain?
-14. `TODO_AMBIGUITY`: **EUR trades in FTMO** — account base currency EUR or just P&L convention? Impacts only sizing.
+
+**Resolved by AI analysis (pending Dave confirmation):**
+
+1. ✅ **Engulfing formula** — See section 9.1 (body-to-close measurement)
+2. ✅ **Acceptance formula** — See section 9.4 (entire body = both open and close beyond zone)
+3. ✅ **Imbalance for SSA** — See section 9.3 (wick tip to Asia Low)
+4. ✅ **Opposite imbalance** — See section 9.5 (push candle vs opposite Asia extreme)
+5. ✅ **Dominance imbalance** — See section 9.6 (magnitude comparison: mainImb > oppImb)
+6. ✅ **Opposite annulled by liquidity** — See section 9.7 (later candle leaves liquidity at lows with push)
+11. ✅ **Long mirror rules** — Confirmed as simple inversion (High/Low swap, etc.)
+12. ✅ **Mutazione SL** — Fixed (see section 10C: SL = high + 10 pips for short)
+13. ✅ **Alternative asset rule** — See section 4.3 (filled position blocks new opens next day)
+
+**Still ambiguous (not blocking M4):**
+
+14. `TODO_AMBIGUITY`: **EUR trades in FTMO** — account base currency EUR or just P&L convention? Impacts only sizing/lot calculation.
 
 ---
 

@@ -57,3 +57,38 @@ model BarM15 {
   @@unique([symbol, timeOpen])
   @@schema("ea_gateway")
 }
+
+model Signal {
+  id               String   @id @default(cuid())
+  symbol           String
+  timestamp        DateTime // Bar close time (timeClose of the trigger bar)
+  dateRome         String   // Rome calendar date "YYYY-MM-DD"
+  setupType        String   // "S1_SHORT" | "S1_LONG"
+  valid            Boolean
+
+  // Metrics (all in pips, null if not applicable)
+  acceptance       Float?
+  engulfing        Float?
+  liquidity        Float?
+  oppositeImb      Float?
+  mainImb          Float?
+
+  // Reason codes (array of strings, empty if valid)
+  // e.g. ["ACCEPTANCE_INSUFFICIENT", "LIQUIDITY_PRESENT"]
+  reasonCodes      String[] @default([])
+
+  // Reference data
+  asiaRangeId      String?
+  asiaHigh         Float
+  asiaLow          Float
+
+  // Candles involved (store bar timestamps for replay)
+  pushCandleTime   DateTime?
+  engulfCandleTime DateTime?
+
+  createdAt        DateTime @default(now())
+
+  @@index([symbol, timestamp])
+  @@index([dateRome, symbol])
+  @@schema("strategy")
+}
