@@ -67,7 +67,28 @@ src/
 - Commands and Queries are plain classes with no methods — just constructor data.
 - Handlers contain all logic. Controllers only dispatch to the bus and return the result.
 - Query handlers go directly to the repository. They do not touch the domain model.
-- Never put business logic in a controller.
+- **Controllers MUST NOT contain business logic.** Controllers are pure API adapters: validate input via DTOs, dispatch to CommandBus/QueryBus, return result. No loops, no conditionals, no repository calls, no service calls.
+- **All POST/PUT/DELETE operations MUST use Commands.** Create a Command class (`commands/impl/`) and CommandHandler (`commands/handlers/`). The controller calls `this.commandBus.execute(new MyCommand(...))`.
+- **All GET operations MUST use Queries.** Create a Query class (`queries/impl/`) and QueryHandler (`queries/handlers/`). The controller calls `this.queryBus.execute(new MyQuery(...))`.
+- **DTOs are mandatory for request bodies.** Use `@Body() dto: MyDto` with `class-validator` decorators for validation. Never use `@Query()` params for POST requests.
+- **Example of correct controller:**
+  ```typescript
+  @Post('replay-s1-signals')
+  async replayS1Signals(@Body() dto: ReplayS1SignalsDto): Promise<ReplayS1SignalsResult> {
+    return this.commandBus.execute(new ReplayS1SignalsCommand(dto.symbol));
+  }
+  ```
+- **Example of incorrect controller (business logic in controller):**
+  ```typescript
+  @Post('replay-s1-signals')
+  async replayS1Signals(@Query('symbol') symbol: string) {
+    const bars = await this.barRepository.findAll(symbol); // ❌ NO - repository call
+    for (const bar of bars) { // ❌ NO - business logic loop
+      await this.service.process(bar); // ❌ NO - service call
+    }
+    return { processed: bars.length };
+  }
+  ```
 
 ## Domain Model Rules
 

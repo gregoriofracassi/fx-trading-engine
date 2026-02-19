@@ -43,4 +43,16 @@ export class AsiaRangeRepository {
       data: { finalized: true },
     });
   }
+
+  /**
+   * Find all AsiaRanges for a symbol.
+   * Returns ranges ordered by date (oldest first).
+   * Used by replay commands to fetch all ranges upfront (optimization).
+   */
+  async findAllBySymbol(symbol: string): Promise<AsiaRange[]> {
+    return this.prisma.asiaRange.findMany({
+      where: { symbol },
+      orderBy: { date: 'asc' },
+    });
+  }
 }

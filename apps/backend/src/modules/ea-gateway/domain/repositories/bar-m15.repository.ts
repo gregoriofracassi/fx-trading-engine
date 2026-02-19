@@ -49,29 +49,15 @@ export class BarM15Repository {
     return row ?? null;
   }
 
-  async findAllBySymbol(symbol: string): Promise<
-    {
-      symbol: string;
-      timeOpen: Date;
-      timeClose: Date;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-    }[]
-  > {
+  /**
+   * Find all bars for a symbol (full BarM15 objects).
+   * Returns bars in chronological order (oldest first).
+   * Used by replay endpoints.
+   */
+  async findAllBySymbol(symbol: string): Promise<BarM15[]> {
     return this.prisma.barM15.findMany({
       where: { symbol },
       orderBy: { timeOpen: 'asc' },
-      select: {
-        symbol: true,
-        timeOpen: true,
-        timeClose: true,
-        open: true,
-        high: true,
-        low: true,
-        close: true,
-      },
     });
   }
 

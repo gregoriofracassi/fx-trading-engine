@@ -8,11 +8,11 @@ export interface CreateSignalInput {
   dateRome: string;
   setupType: string;
   valid: boolean;
-  acceptance?: number;
-  engulfing?: number;
-  liquidity?: number;
-  oppositeImb?: number;
-  mainImb?: number;
+  acceptance?: number | null;
+  engulfing?: number | null;
+  liquidity?: number | null;
+  oppositeImb?: number | null;
+  mainImb?: number | null;
   reasonCodes: string[];
   asiaRangeId?: string;
   asiaHigh: number;
