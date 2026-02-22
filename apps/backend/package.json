@@ -7,7 +7,9 @@
     "dev": "nest start --watch",
     "start": "node dist/main",
     "lint": "eslint \"{src,test}/**/*.ts\"",
-    "test": "jest --config jest.config.ts"
+    "test": "pnpm test:unit && pnpm test:e2e",
+    "test:unit": "jest --config jest.unit.config.ts",
+    "test:e2e": "jest --config jest.config.ts --passWithNoTests"
   },
   "dependencies": {
     "@nestjs/common": "^10.0.0",

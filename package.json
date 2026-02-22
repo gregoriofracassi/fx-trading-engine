@@ -20,7 +20,8 @@
   "lint-staged": {
     "apps/backend/src/**/*.ts": [
       "prettier --write",
-      "pnpm --filter @fx-trading/backend exec eslint"
+      "pnpm --filter @fx-trading/backend exec eslint",
+      "pnpm --filter @fx-trading/backend test:unit --bail --findRelatedTests"
     ]
   },
   "packageManager": "pnpm@9.0.0",

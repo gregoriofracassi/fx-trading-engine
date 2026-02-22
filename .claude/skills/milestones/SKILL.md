@@ -94,7 +94,7 @@ description: Development milestones plan for the FX trading engine. Covers 10 mi
 
 ---
 
-## Milestone 4 — S1 Detector "Read-Only" (Signal Records, No Orders) ← CURRENT
+## Milestone 4 — S1 Detector "Read-Only" (Signal Records, No Orders) ✅
 
 **Goal:** Implement S1 signal detection and write `Signal` records to DB — no order placement.
 
@@ -112,6 +112,77 @@ description: Development milestones plan for the FX trading engine. Covers 10 mi
 - DB shows `Signal` records (valid and invalid) with sensible reason codes
 - At least 1 valid signal appears on days with typical setups
 - Logic verified against chart before any order risk
+
+---
+
+## Milestone 4.5 — Historical Data Backfill (6 Months) ← CURRENT
+
+**Goal:** Load 6 months of historical M15 bar data automatically via EA to enable comprehensive S1 testing and strategy validation.
+
+**Why here:** Before building the command infrastructure (M5+), you need sufficient data to verify S1 detection works correctly across various market conditions. S1 signals are relatively rare, so a few days of data isn't enough. 6 months provides statistical confidence.
+
+**Architecture:**
+
+- **Data source:** MT5 EA fetches bars via `CopyRates()` (up to 100k bars available)
+- **Trigger mechanism:** Piggyback on existing `GET /api/ea/last-bar` endpoint (zero extra polling)
+- **Transport:** Chunked uploads (500 bars/chunk, ~133 KB each) to avoid timeouts
+- **Module:** Uses `backtest` module infrastructure, not `ea-gateway`
+- **Concurrency:** Multiple symbols can backfill simultaneously (async handlers)
+
+**Backend Implementation:**
+
+1. **Backfill state tracking:**
+   - In-memory map: `symbol → barsRequested` (or Redis for persistence)
+   - Admin trigger: `POST /api/backtest/request-historical-backfill { symbol, barsCount }`
+   - Sets flag that EA will pick up on next `GET /api/ea/last-bar` call
+
+2. **Enhanced last-bar response:**
+   - `GET /api/ea/last-bar?symbol=EURUSD` returns:
+   ```json
+   {
+     "timeOpen": "2024-08-01T10:15:00.000Z",
+     "historicalBackfill": {
+       "requested": true,
+       "barsCount": 17520
+     }
+   }
+   ```
+
+3. **Chunk ingestion endpoint:**
+   - `POST /api/backtest/historical-bars/chunk`
+   - Receives 500 bars per call, upserts to `BarM15` with `source='HISTORICAL'`
+   - Returns progress: `{ chunksReceived: 15, totalChunks: 36, barsIngested: 7500 }`
+
+4. **Completion acknowledgment:**
+   - `POST /api/backtest/historical-backfill/complete { symbol }`
+   - Clears the in-memory flag so EA stops sending
+
+**EA Implementation:**
+
+1. **Check for backfill request** (every bar close, piggybacked):
+   - Parse `historicalBackfill` section from `GET /api/ea/last-bar` response
+   - If `requested=true`, trigger `ExecuteHistoricalBackfill()`
+
+2. **Chunked upload:**
+   - Fetch bars via `CopyRates(Symbol(), PERIOD_M15, 0, barsCount, rates)`
+   - Split into chunks of 500 bars
+   - Send each chunk to `POST /api/backtest/historical-bars/chunk`
+   - Sleep 100ms between chunks to avoid overwhelming backend
+
+3. **Completion:**
+   - After all chunks sent, call `POST /api/backtest/historical-backfill/complete`
+   - Log summary: "Historical backfill complete: 17,520 bars for EURUSD"
+
+**Definition of Done:**
+
+- Admin triggers backfill: `POST /api/backtest/request-historical-backfill { symbol: "EURUSD", barsCount: 17520 }`
+- EA automatically fetches and sends 17,520 bars in 36 chunks within ~2-3 minutes
+- `BarM15` table shows 17,520 rows with `source='HISTORICAL'` for EURUSD
+- No duplicates (unique constraint on `symbol, timeOpen` enforced)
+- Works for multiple symbols concurrently (trigger EURUSD, GBPUSD, USDJPY simultaneously)
+- Replay endpoints (Asia Range, S1 signals) can process full 6-month dataset
+
+> This gives you a solid foundation to validate S1 detector performance before any execution risk. See `.claude/skills/m4.5-historical-backfill/SKILL.md` for full implementation plan.
 
 ---
 

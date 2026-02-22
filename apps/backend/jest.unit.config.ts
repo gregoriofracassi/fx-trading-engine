@@ -3,12 +3,12 @@ import type { Config } from 'jest';
 const config: Config = {
   moduleFileExtensions: ['js', 'json', 'ts'],
   rootDir: '.',
-  testRegex: '.*\\.e2e-spec\\.ts$', // Only .e2e-spec.ts files (E2E tests)
+  testRegex: '.*\\.spec\\.ts$', // Only .spec.ts files (unit tests)
   transform: {
     '^.+\\.(t|j)s$': 'ts-jest',
   },
   collectCoverageFrom: ['src/**/*.(t|j)s'],
-  coverageDirectory: './coverage/e2e',
+  coverageDirectory: './coverage/unit',
   testEnvironment: 'node',
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
