@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CqrsModule } from '@nestjs/cqrs';
 import { DatabaseModule } from '../../database/database.module';
+import { BacktestModule } from '../backtest/backtest.module';
 import { EaGatewayController } from './controllers/ea-gateway.controller';
 import { ProcessEaEventHandler } from './commands/handlers/process-ea-event.handler';
 import { ProcessBarM15Handler } from './commands/handlers/process-bar-m15.handler';
@@ -15,7 +16,7 @@ const Services = [EaGatewayService];
 const Repositories = [AuditEventRepository, BarM15Repository];
 
 @Module({
-  imports: [CqrsModule, DatabaseModule],
+  imports: [CqrsModule, DatabaseModule, BacktestModule],
   controllers: [EaGatewayController],
   providers: [...CommandHandlers, ...QueryHandlers, ...Services, ...Repositories],
   exports: [BarM15Repository],

@@ -1,11 +1,13 @@
 //+------------------------------------------------------------------+
 //| HeartbeatEA.mq5                                                  |
-//| Milestone 1+2 — EA connectivity + M15 bar close ingestion        |
+//| Milestone 1+2+4.5 — EA connectivity + M15 bar ingestion +        |
+//| historical backfill (6 months)                                   |
 //| On every bar close: asks backend for its last known bar,         |
 //| then sends all missing closed bars in a single batch POST.       |
+//| Also checks for historical backfill requests and executes them.  |
 //+------------------------------------------------------------------+
 #property copyright ""
-#property version   "1.03"
+#property version   "1.10"
 #property strict
 
 //--- Input parameters
@@ -76,11 +78,15 @@ void CheckBarClose()
 //| Single send path. Asks backend for its last known bar, builds    |
 //| a JSON array of every missing closed bar, sends in one POST.    |
 //| Handles: startup, reconnect, and normal bar close identically.  |
+//| Also checks for historical backfill requests (M4.5).            |
 //+------------------------------------------------------------------+
 void BackfillMissingBars()
 {
    //--- 1. Ask backend for last known bar timeOpen (ISO 8601 string or "null")
-   string lastKnownIso = QueryLastBar(Symbol());
+   string lastKnownResponse = QueryLastBar(Symbol());
+
+   //--- 1a. Extract timeOpen from response (priority: normal bar ingestion first)
+   string lastKnownIso = ExtractTimeOpen(lastKnownResponse);
 
    datetime fromTime = 0;
 
@@ -177,13 +183,15 @@ void BackfillMissingBars()
    int    status = SendPost(body);
 
    Print("Backfill | ", Symbol(), " | sent=", sentCount, " bars | HTTP=", status);
+
+   //--- 5. Check for historical backfill request (M4.5) — runs AFTER normal bars sent
+   CheckHistoricalBackfillRequest(lastKnownResponse);
 }
 
 //+------------------------------------------------------------------+
 //| QueryLastBar                                                     |
 //| GET /api/ea/last-bar?symbol=EURUSD                               |
-//| Returns the timeOpen ISO string, "null" if no data, or ""       |
-//| on network error.                                                |
+//| Returns the full JSON response or "" on error.                   |
 //+------------------------------------------------------------------+
 string QueryLastBar(string symbol)
 {
@@ -210,16 +218,28 @@ string QueryLastBar(string symbol)
    string responseStr = CharArrayToString(result);
    Print("QueryLastBar raw response: ", responseStr);
 
+   return responseStr;
+}
+
+//+------------------------------------------------------------------+
+//| ExtractTimeOpen                                                  |
+//| Extracts timeOpen value from last-bar JSON response             |
+//+------------------------------------------------------------------+
+string ExtractTimeOpen(string response)
+{
+   if(response == "")
+      return "";
+
    string key = "\"timeOpen\":";
-   int keyPos = StringFind(responseStr, key);
+   int keyPos = StringFind(response, key);
    if(keyPos < 0)
    {
-      Print("QueryLastBar: 'timeOpen' not found in response");
+      Print("ExtractTimeOpen: 'timeOpen' not found in response");
       return "";
    }
 
    int    valueStart = keyPos + StringLen(key);
-   string rest       = StringSubstr(responseStr, valueStart);
+   string rest       = StringSubstr(response, valueStart);
 
    if(StringSubstr(rest, 0, 4) == "null")
       return "null";
@@ -232,6 +252,175 @@ string QueryLastBar(string symbol)
    }
 
    return "";
+}
+
+//+------------------------------------------------------------------+
+//| CheckHistoricalBackfillRequest (M4.5)                           |
+//| Parses last-bar response for historicalBackfill flag            |
+//| If detected, triggers historical data upload                     |
+//+------------------------------------------------------------------+
+void CheckHistoricalBackfillRequest(string response)
+{
+   if(response == "")
+      return;
+
+   //--- Check for historicalBackfill section
+   int backfillPos = StringFind(response, "\"historicalBackfill\"");
+   if(backfillPos < 0)
+      return; // No backfill requested
+
+   //--- Extract barsRequested
+   int barsPos = StringFind(response, "\"barsRequested\":", backfillPos);
+   if(barsPos < 0)
+      return;
+
+   int valueStart = barsPos + StringLen("\"barsRequested\":");
+   string substr = StringSubstr(response, valueStart);
+
+   //--- Find end of number (comma or closing brace)
+   int endPos = 0;
+   for(int i = 0; i < StringLen(substr); i++)
+   {
+      string ch = StringSubstr(substr, i, 1);
+      if(ch == "," || ch == "}")
+      {
+         endPos = i;
+         break;
+      }
+   }
+
+   if(endPos == 0)
+      return;
+
+   string barsStr = StringSubstr(substr, 0, endPos);
+   StringTrimLeft(barsStr);
+   StringTrimRight(barsStr);
+
+   int barsCount = (int)StringToInteger(barsStr);
+
+   if(barsCount <= 0)
+      return;
+
+   Print("Historical backfill requested: ", barsCount, " bars for ", Symbol());
+
+   ExecuteHistoricalBackfill(Symbol(), barsCount);
+}
+
+//+------------------------------------------------------------------+
+//| ExecuteHistoricalBackfill (M4.5)                                |
+//| Fetches historical bars and sends in chunks of 500              |
+//+------------------------------------------------------------------+
+void ExecuteHistoricalBackfill(string symbol, int totalBars)
+{
+   const int CHUNK_SIZE = 500;
+   int totalChunks = (int)MathCeil(totalBars / (double)CHUNK_SIZE);
+
+   Print("Starting historical backfill: ", totalBars, " bars in ", totalChunks, " chunks");
+
+   //--- Fetch all bars at once (chronological order, oldest first)
+   MqlRates rates[];
+   ArraySetAsSeries(rates, false);
+
+   int copied = CopyRates(symbol, PERIOD_M15, 0, totalBars, rates);
+
+   if(copied <= 0)
+   {
+      Print("Historical backfill FAILED: CopyRates returned 0");
+      return;
+   }
+
+   Print("Fetched ", copied, " bars from MT5 history");
+
+   //--- Send in chunks
+   for(int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+   {
+      int startIdx = chunkIndex * CHUNK_SIZE;
+      int endIdx = (int)MathMin(startIdx + CHUNK_SIZE, copied);
+      int chunkSize = endIdx - startIdx;
+
+      //--- Build JSON for this chunk
+      string items = "";
+
+      for(int i = startIdx; i < endIdx; i++)
+      {
+         string timeOpen  = TimeToString(rates[i].time,       TIME_DATE | TIME_SECONDS);
+         string timeClose = TimeToString(rates[i].time + 900, TIME_DATE | TIME_SECONDS);
+
+         string item = StringFormat(
+            "{\"timeOpen\":\"%s\",\"timeClose\":\"%s\",\"open\":%.5f,\"high\":%.5f,\"low\":%.5f,\"close\":%.5f,\"tickVolume\":%d,\"spreadPoints\":%d}",
+            timeOpen, timeClose,
+            rates[i].open, rates[i].high, rates[i].low, rates[i].close,
+            (int)rates[i].tick_volume, (int)rates[i].spread
+         );
+
+         if(i > startIdx)
+            items += ",";
+         items += item;
+      }
+
+      string body = StringFormat(
+         "{\"symbol\":\"%s\",\"chunkNumber\":%d,\"totalChunks\":%d,\"bars\":[%s]}",
+         symbol, chunkIndex + 1, totalChunks, items
+      );
+
+      int status = SendHistoricalChunk(body);
+
+      if(status != 200 && status != 201)
+      {
+         Print("Historical backfill FAILED: HTTP ", status, " at chunk ", chunkIndex + 1);
+         return;
+      }
+
+      Print("Historical backfill progress: chunk ", chunkIndex + 1, "/", totalChunks, " (", chunkSize, " bars)");
+
+      Sleep(100); // Small delay between chunks
+   }
+
+   //--- Signal completion
+   CompleteHistoricalBackfill(symbol);
+
+   Print("Historical backfill COMPLETED: ", copied, " bars for ", symbol);
+}
+
+//+------------------------------------------------------------------+
+//| SendHistoricalChunk (M4.5)                                       |
+//| POST /api/backtest/historical-bars/chunk                        |
+//+------------------------------------------------------------------+
+int SendHistoricalChunk(string body)
+{
+   string url        = BackendBaseUrl + "/api/backtest/historical-bars/chunk";
+   string reqHeaders = "Content-Type: application/json\r\n";
+   char   postData[];
+   char   result[];
+   string resultHeaders;
+
+   StringToCharArray(body, postData, 0, StringLen(body));
+
+   return WebRequest("POST", url, reqHeaders, 30000, postData, result, resultHeaders);
+}
+
+//+------------------------------------------------------------------+
+//| CompleteHistoricalBackfill (M4.5)                               |
+//| POST /api/backtest/historical-backfill/complete                 |
+//+------------------------------------------------------------------+
+void CompleteHistoricalBackfill(string symbol)
+{
+   string body = StringFormat("{\"symbol\":\"%s\"}", symbol);
+
+   string url        = BackendBaseUrl + "/api/backtest/historical-backfill/complete";
+   string reqHeaders = "Content-Type: application/json\r\n";
+   char   postData[];
+   char   result[];
+   string resultHeaders;
+
+   StringToCharArray(body, postData, 0, StringLen(body));
+
+   int status = WebRequest("POST", url, reqHeaders, 5000, postData, result, resultHeaders);
+
+   if(status != 200 && status != 201)
+   {
+      Print("CompleteHistoricalBackfill: HTTP ", status);
+   }
 }
 
 //+------------------------------------------------------------------+

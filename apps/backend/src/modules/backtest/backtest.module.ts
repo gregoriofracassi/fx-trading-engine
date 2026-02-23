@@ -1,23 +1,28 @@
 import { Module } from '@nestjs/common';
+import { CqrsModule } from '@nestjs/cqrs';
 import { BacktestController } from './controllers/backtest.controller';
-import { BacktestRunRepository } from './domain/repositories/backtest-run.repository';
-import { BacktestService } from './domain/services/backtest.service';
-import { HistoricalDataService } from './domain/services/historical-data.service';
-import { SimulatedFillService } from './domain/services/simulated-fill.service';
-import { SimulatedStateService } from './domain/services/simulated-state.service';
+import { HistoricalBarRepository } from './domain/repositories/historical-bar.repository';
+import { BackfillStateService } from './domain/services/backfill-state.service';
+import { HistoricalBarIngestionService } from './domain/services/historical-bar-ingestion.service';
+import { RequestHistoricalBackfillHandler } from './commands/handlers/request-historical-backfill.handler';
+import { IngestHistoricalChunkHandler } from './commands/handlers/ingest-historical-chunk.handler';
+import { CompleteHistoricalBackfillHandler } from './commands/handlers/complete-historical-backfill.handler';
 import { DatabaseModule } from '../../database/database.module';
 
-const Services = [
-  BacktestService,
-  HistoricalDataService,
-  SimulatedFillService,
-  SimulatedStateService,
+const Services = [BackfillStateService, HistoricalBarIngestionService];
+
+const CommandHandlers = [
+  RequestHistoricalBackfillHandler,
+  IngestHistoricalChunkHandler,
+  CompleteHistoricalBackfillHandler,
 ];
 
+const Repositories = [HistoricalBarRepository];
+
 @Module({
-  imports: [DatabaseModule],
+  imports: [DatabaseModule, CqrsModule],
   controllers: [BacktestController],
-  providers: [...Services, BacktestRunRepository],
-  exports: [],
+  providers: [...Services, ...CommandHandlers, ...Repositories],
+  exports: [BackfillStateService],
 })
 export class BacktestModule {}

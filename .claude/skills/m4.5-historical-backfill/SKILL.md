@@ -9,682 +9,402 @@ description: Implementation plan for Milestone 4.5 — Historical Data Backfill 
 
 **Goal:** Automatically load 6 months (~17,520 bars) of historical M15 data from MT5 into the backend database to enable comprehensive S1 signal testing and strategy validation.
 
-**Key Architectural Decisions:**
-
-1. **Data Source:** MT5 EA fetches bars via `CopyRates()` — no external APIs or CSV exports needed
-2. **Trigger Mechanism:** Piggyback on existing `GET /api/ea/last-bar` endpoint — zero extra HTTP polling
-3. **Transport:** Chunked uploads (500 bars/chunk) to avoid timeouts and enable resilience
-4. **Module:** Uses `backtest` module, keeping separation from live `ea-gateway` infrastructure
-5. **Concurrency:** Multiple symbols can backfill simultaneously via async handlers
+**Purpose:** Before testing the S1 signal detector with live data, we need historical data to validate the detector logic, test Asia range calculations, and ensure the strategy behaves correctly across different market conditions. This milestone provides the infrastructure to backfill months of data without manual CSV exports or external APIs.
 
 ---
 
-## Implementation Steps
+## Architecture Philosophy
+
+### Key Decisions
+
+1. **Data Source: MT5 EA via CopyRates()**
+   - No external APIs (FXCM, CSV exports, etc.)
+   - EA has direct access to MT5 historical data (up to 100,000 bars)
+   - Simplest, most reliable source of truth for the broker data we'll trade on
+
+2. **Trigger Mechanism: Piggyback Pattern**
+   - Reuse existing `GET /api/ea/last-bar` endpoint that EA calls on every bar close
+   - Backend adds optional `historicalBackfill` section to response when backfill requested
+   - Zero additional HTTP polling overhead
+
+3. **Transport: Chunked Uploads**
+   - 500 bars per chunk (~133 KB)
+   - 36 chunks for 17,520 bars (6 months of M15 data)
+   - Total upload time: ~2-3 minutes per symbol
+   - Prevents timeouts, enables progress tracking
+
+4. **Module Separation**
+   - Uses `backtest` module (not `ea-gateway`)
+   - Keeps backfill infrastructure separate from live trading
+   - Clean separation of concerns: ea-gateway = live, backtest = historical
+
+5. **State Management: In-Memory Map**
+   - Simple `Map<symbol, BackfillRequest>` in BackfillStateService
+   - Fast lookups (checked on every bar close)
+   - Sufficient for M4.5 (backfill completes in 2-3 minutes, low risk of backend restart)
+   - **Future consideration:** Migrate to Redis for persistence across restarts
+
+6. **Concurrency: Async Handlers**
+   - Multiple symbols can backfill simultaneously
+   - Each EA instance (attached to different symbol charts) uploads independently
+   - Backend handles concurrent chunk ingestion via async CQRS handlers
+   - **Future consideration:** Use BullMQ for background job processing to avoid blocking live bar ingestion
+
+---
+
+## System Flow
+
+### 1. Admin Triggers Backfill
+
+**Actor:** Admin (via Postman, curl, or future admin UI)
+
+**Action:** `POST /api/backtest/request-historical-backfill`
+
+**Payload:**
+```json
+{
+  "symbol": "EURUSD",
+  "barsCount": 17520
+}
+```
+
+**What Happens:**
+- `BacktestController` receives request
+- Dispatches `RequestHistoricalBackfillCommand` via CQRS CommandBus
+- `RequestHistoricalBackfillHandler` calls `BackfillStateService.createRequest()`
+- In-memory state created:
+  ```typescript
+  {
+    symbol: "EURUSD",
+    barsRequested: 17520,
+    barsIngested: 0,
+    chunksReceived: 0,
+    totalChunks: 36, // Math.ceil(17520 / 500)
+    createdAt: new Date()
+  }
+  ```
+- Response confirms request accepted: `"EA will pick up this request on next bar close"`
+
+**Why this approach:**
+- On-demand triggering (admin decides when to backfill)
+- Multiple symbols can be queued independently
+- No automatic backfill on EA startup (cleaner, more controlled)
+
+---
+
+### 2. EA Detects Backfill Request
+
+**Actor:** HeartbeatEA.mq5 running on MT5 chart (e.g., EURUSD M15)
+
+**Trigger:** Normal bar close (happens every 15 minutes)
+
+**Flow:**
+1. Timer fires every 1 second (via `OnTimer()`)
+2. `CheckBarClose()` detects new closed bar (dedup gate using `lastClosedBarTime`)
+3. Calls `BackfillMissingBars()`
+4. **Step 1: Sends normal bars first (priority)**
+   - Queries backend: `GET /api/ea/last-bar?symbol=EURUSD`
+   - Backend response includes `historicalBackfill` section if backfill requested:
+     ```json
+     {
+       "symbol": "EURUSD",
+       "timeOpen": "2026-02-23T14:45:00.000Z",
+       "historicalBackfill": {
+         "requested": true,
+         "barsRequested": 17520,
+         "totalChunks": 36
+       }
+     }
+     ```
+   - EA extracts `timeOpen`, builds array of missing normal bars, sends in single batch POST
+   - **This happens FIRST, takes <1 second, never delayed by backfill**
+
+5. **Step 2: Executes historical backfill (after normal bars sent)**
+   - `CheckHistoricalBackfillRequest()` parses `historicalBackfill` section
+   - Extracts `barsRequested` value (17520)
+   - Calls `ExecuteHistoricalBackfill(Symbol(), 17520)`
+
+**Why this order:**
+- Normal bar ingestion is time-sensitive (live trading data)
+- Historical backfill is background task (can take 2-3 minutes)
+- Ensures live data is never delayed
+
+---
+
+### 3. EA Uploads Historical Chunks
+
+**Actor:** HeartbeatEA.mq5 `ExecuteHistoricalBackfill()` function
+
+**Process:**
+
+1. **Fetch all bars from MT5 history**
+   ```mql5
+   MqlRates rates[];
+   ArraySetAsSeries(rates, false); // Chronological order (oldest first)
+   int copied = CopyRates(Symbol(), PERIOD_M15, 0, 17520, rates);
+   ```
+   - MT5 CopyRates() can fetch up to 100,000 bars (more than enough for 6 months)
+   - Returns actual count (may be less if MT5 doesn't have full history)
+
+2. **Send in 500-bar chunks**
+   - Loop through 36 chunks (0 to 35)
+   - For each chunk:
+     - Build JSON array of 500 bars (timeOpen, timeClose, OHLC, volume, spread)
+     - POST to `/api/backtest/historical-bars/chunk`
+     - Wait for 200/201 response
+     - Sleep(100ms) between chunks (prevent server overload)
+     - Log progress: "chunk 15/36 (500 bars)"
+
+3. **Signal completion**
+   - After all chunks sent, POST to `/api/backtest/historical-backfill/complete`
+   - Removes backfill request from backend state
+   - Future `GET /api/ea/last-bar` calls no longer include `historicalBackfill` section
+
+**Blocking Behavior:**
+- EA runs single-threaded (MQL5 limitation)
+- During 2-3 minute upload, no other timer events fire
+- Any bars that close during upload are caught on next timer tick after upload completes
+- Normal backfill (missing bars from last known) handles any gaps automatically
+
+**Why this approach:**
+- Simplest implementation (no threading complexity)
+- Backfill is one-time operation per symbol
+- 2-3 minutes of blocking is acceptable for historical data load
+
+---
+
+### 4. Backend Ingests Chunks
+
+**Actor:** Backend CQRS handlers
+
+**Flow per chunk:**
+
+1. **Request arrives:** `POST /api/backtest/historical-bars/chunk`
+   ```json
+   {
+     "symbol": "EURUSD",
+     "chunkNumber": 15,
+     "totalChunks": 36,
+     "bars": [ /* 500 bar objects */ ]
+   }
+   ```
+
+2. **Controller validates and dispatches:**
+   - DTO validation (class-validator)
+   - Dispatches `IngestHistoricalChunkCommand` via CommandBus
+
+3. **Handler processes chunk:**
+   - `IngestHistoricalChunkHandler.execute()`
+   - Validates chunk against active backfill request:
+     - Checks `BackfillStateService.getRequest(symbol)` exists
+     - Throws `BackfillNotFoundException` (404) if no active request
+     - Validates `totalChunks` matches expected value
+     - Throws `ChunkValidationException` (400) if mismatch
+   - Delegates to `HistoricalBarIngestionService.ingestBars()`
+   - Service calls `HistoricalBarRepository.upsert()` for each bar
+   - Repository uses Prisma upsert with unique constraint `(symbol, timeOpen)`:
+     ```prisma
+     @@unique([symbol, timeOpen], name: "symbol_timeOpen")
+     ```
+   - Updates progress: `BackfillStateService.incrementProgress(symbol, barsCount)`
+   - Returns progress info:
+     ```json
+     {
+       "message": "Chunk 15/36 ingested successfully",
+       "symbol": "EURUSD",
+       "chunkNumber": 15,
+       "totalChunks": 36,
+       "barsIngested": 7500,
+       "barsInChunk": 500
+     }
+     ```
+
+**Idempotency:**
+- Prisma upsert ensures duplicate bars (same symbol + timeOpen) don't cause errors
+- If EA retries chunk, existing bars are updated (no duplicates)
+- Enables resumption after interruption
+
+**Why this design:**
+- CQRS keeps business logic in handlers (not controllers)
+- Repository pattern isolates Prisma (only place PrismaService injected)
+- Custom exceptions map to correct HTTP status codes via ApplicationExceptionFilter
+- Service layer reduces handler complexity (ESLint complexity check)
+
+---
+
+### 5. Admin Monitors Progress
+
+**Actor:** Admin
+
+**Tools:**
+
+1. **Get all active backfills:** `GET /api/backtest/backfill-status`
+   ```json
+   [
+     {
+       "symbol": "EURUSD",
+       "barsRequested": 17520,
+       "barsIngested": 7500,
+       "chunksReceived": 15,
+       "totalChunks": 36,
+       "createdAt": "2026-02-23T15:00:00.000Z"
+     }
+   ]
+   ```
+
+2. **Query database directly:**
+   ```sql
+   SELECT COUNT(*)
+   FROM "BarM15"
+   WHERE symbol = 'EURUSD' AND source = 'HISTORICAL';
+   ```
+
+**Source field differentiation:**
+- `LIVE` - Real-time bars from normal EA operation
+- `HISTORICAL` - Backfilled bars from M4.5
+- Enables filtering, debugging, and data provenance tracking
+
+---
+
+## Implementation Steps (Completed)
 
 ### Step 1: Backend State Management
+**Status:** ✅ Complete
 
-**Goal:** Create in-memory state to track which symbols need historical backfill.
+**Created:**
+- `BackfillStateService` - In-memory Map to track active backfill requests
+- Methods: createRequest, getRequest, incrementProgress, completeRequest, getAllRequests
 
-**Files to create/modify:**
-
-1. **Create backfill state service:**
-
-```typescript
-// apps/backend/src/modules/backtest/domain/services/backfill-state.service.ts
-
-import { Injectable } from '@nestjs/common';
-
-export interface BackfillRequest {
-  symbol: string;
-  barsRequested: number;
-  barsIngested: number;
-  chunksReceived: number;
-  totalChunks: number;
-  createdAt: Date;
-}
-
-@Injectable()
-export class BackfillStateService {
-  private readonly requests = new Map<string, BackfillRequest>();
-
-  createRequest(symbol: string, barsCount: number): BackfillRequest {
-    const totalChunks = Math.ceil(barsCount / 500);
-    const request: BackfillRequest = {
-      symbol,
-      barsRequested: barsCount,
-      barsIngested: 0,
-      chunksReceived: 0,
-      totalChunks,
-      createdAt: new Date(),
-    };
-    this.requests.set(symbol, request);
-    return request;
-  }
-
-  getRequest(symbol: string): BackfillRequest | undefined {
-    return this.requests.get(symbol);
-  }
-
-  incrementProgress(symbol: string, barsCount: number): BackfillRequest | undefined {
-    const request = this.requests.get(symbol);
-    if (!request) return undefined;
-
-    request.barsIngested += barsCount;
-    request.chunksReceived += 1;
-    return request;
-  }
-
-  completeRequest(symbol: string): void {
-    this.requests.delete(symbol);
-  }
-
-  getAllRequests(): BackfillRequest[] {
-    return Array.from(this.requests.values());
-  }
-}
-```
-
-2. **Register in BacktestModule:**
-
-```typescript
-// apps/backend/src/modules/backtest/backtest.module.ts
-
-import { BackfillStateService } from './domain/services/backfill-state.service';
-
-const Services = [
-  BacktestService,
-  HistoricalDataService,
-  SimulatedFillService,
-  SimulatedStateService,
-  BackfillStateService, // NEW
-];
-```
-
-**Testable Definition of Done:**
-
-- [ ] `BackfillStateService` can create, get, update, and delete backfill requests
-- [ ] Multiple symbols can have active requests simultaneously
-- [ ] Progress tracking works (barsIngested increments correctly)
+**Registered in:**
+- `BacktestModule` providers
+- Exported for use by `EaGatewayModule`
 
 ---
 
 ### Step 2: Admin Trigger Endpoint
+**Status:** ✅ Complete
 
-**Goal:** Create endpoint to trigger historical backfill for one or more symbols.
+**Created:**
+- `RequestHistoricalBackfillDto` - Validation for symbol and barsCount (max 50,000)
+- `RequestHistoricalBackfillCommand` + Handler (CQRS pattern)
+- `POST /api/backtest/request-historical-backfill` endpoint
+- `GET /api/backtest/backfill-status` endpoint
 
-**Files to create/modify:**
-
-1. **Create DTO:**
-
-```typescript
-// apps/backend/src/modules/backtest/dto/requests/request-historical-backfill.dto.ts
-
-import { IsString, IsNotEmpty, IsNumber, Min, Max } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
-
-export class RequestHistoricalBackfillDto {
-  @ApiProperty({ example: 'EURUSD' })
-  @IsString()
-  @IsNotEmpty()
-  symbol: string;
-
-  @ApiProperty({ example: 17520, description: 'Number of M15 bars to backfill (max 50000)' })
-  @IsNumber()
-  @Min(1)
-  @Max(50000)
-  barsCount: number;
+**Response example:**
+```json
+{
+  "message": "Historical backfill requested for EURUSD",
+  "barsRequested": 17520,
+  "totalChunks": 36,
+  "note": "EA will pick up this request on next bar close"
 }
 ```
-
-2. **Add controller endpoint:**
-
-```typescript
-// apps/backend/src/modules/backtest/controllers/backtest.controller.ts
-
-import { RequestHistoricalBackfillDto } from '../dto/requests/request-historical-backfill.dto';
-import { BackfillStateService } from '../domain/services/backfill-state.service';
-
-@Post('request-historical-backfill')
-@ApiOperation({ summary: 'Trigger historical data backfill from EA for a symbol' })
-async requestHistoricalBackfill(@Body() dto: RequestHistoricalBackfillDto) {
-  const request = this.backfillStateService.createRequest(dto.symbol, dto.barsCount);
-  return {
-    message: `Historical backfill requested for ${dto.symbol}`,
-    barsRequested: request.barsRequested,
-    totalChunks: request.totalChunks,
-    note: 'EA will pick up this request on next bar close',
-  };
-}
-
-@Get('backfill-status')
-@ApiOperation({ summary: 'Get status of all active backfill requests' })
-async getBackfillStatus() {
-  return this.backfillStateService.getAllRequests();
-}
-```
-
-**Testable Definition of Done:**
-
-- [ ] `POST /api/backtest/request-historical-backfill` creates backfill request
-- [ ] Response shows barsRequested and totalChunks
-- [ ] `GET /api/backtest/backfill-status` lists all active requests
-- [ ] Multiple symbols can be triggered (e.g., EURUSD, GBPUSD, USDJPY)
 
 ---
 
 ### Step 3: Enhance Last-Bar Response
+**Status:** ✅ Complete
 
-**Goal:** Modify `GET /api/ea/last-bar` to include historical backfill flag when requested.
+**Modified:**
+- `GetLastBarHandler` - Injects `BackfillStateService`, checks for active request
+- `LastBarResult` interface - Added optional `historicalBackfill` section
+- `EaGatewayModule` - Imports `BacktestModule` to access state service
 
-**Files to modify:**
-
-1. **Update GetLastBarHandler:**
-
-```typescript
-// apps/backend/src/modules/ea-gateway/queries/handlers/get-last-bar.handler.ts
-
-import { BackfillStateService } from '../../../backtest/domain/services/backfill-state.service';
-
-@QueryHandler(GetLastBarQuery)
-export class GetLastBarHandler implements IQueryHandler<GetLastBarQuery> {
-  constructor(
-    private readonly barM15Repository: BarM15Repository,
-    private readonly backfillStateService: BackfillStateService, // NEW
-  ) {}
-
-  async execute(query: GetLastBarQuery): Promise<{
-    timeOpen: string | null;
-    historicalBackfill?: {
-      requested: boolean;
-      barsCount: number;
-    };
-  }> {
-    const lastBar = await this.barM15Repository.findLatest(query.symbol);
-
-    // Check if historical backfill requested
-    const backfillRequest = this.backfillStateService.getRequest(query.symbol);
-
-    const response: any = {
-      timeOpen: lastBar?.timeOpen.toISOString() ?? null,
-    };
-
-    if (backfillRequest) {
-      response.historicalBackfill = {
-        requested: true,
-        barsCount: backfillRequest.barsRequested,
-      };
-    }
-
-    return response;
+**Response example (when backfill active):**
+```json
+{
+  "symbol": "EURUSD",
+  "timeOpen": "2026-02-23T14:45:00.000Z",
+  "historicalBackfill": {
+    "requested": true,
+    "barsRequested": 17520,
+    "totalChunks": 36
   }
 }
 ```
-
-2. **Update EaGatewayModule imports:**
-
-```typescript
-// apps/backend/src/modules/ea-gateway/ea-gateway.module.ts
-
-import { BacktestModule } from '../backtest/backtest.module';
-
-@Module({
-  imports: [DatabaseModule, BacktestModule], // Import BacktestModule
-  // ...
-})
-```
-
-**Testable Definition of Done:**
-
-- [ ] `GET /api/ea/last-bar?symbol=EURUSD` returns normal response when no backfill requested
-- [ ] After triggering backfill, response includes `historicalBackfill: { requested: true, barsCount: 17520 }`
-- [ ] Response reverts to normal after backfill completes
 
 ---
 
 ### Step 4: Chunk Ingestion Endpoint
+**Status:** ✅ Complete
 
-**Goal:** Create endpoint for EA to submit chunks of historical bars.
+**Created:**
+- `UploadHistoricalBarsDto` + `HistoricalBarDto` (nested validation)
+- `IngestHistoricalChunkCommand` + Handler
+- `HistoricalBarIngestionService` - Delegates to repository
+- `HistoricalBarRepository` - Only place Prisma injected for historical bars
+- `POST /api/backtest/historical-bars/chunk` endpoint
+- Custom exceptions: `BackfillNotFoundException`, `ChunkValidationException`
+- Registered exceptions in `ApplicationExceptionFilter` (404, 400)
 
-**Files to create:**
-
-1. **Create DTO:**
-
-```typescript
-// apps/backend/src/modules/backtest/dto/requests/submit-historical-chunk.dto.ts
-
-import { IsString, IsNotEmpty, IsArray, ValidateNested, IsNumber } from 'class-validator';
-import { Type } from 'class-transformer';
-import { ApiProperty } from '@nestjs/swagger';
-
-export class HistoricalBarDto {
-  @ApiProperty()
-  @IsString()
-  timeOpen: string;
-
-  @ApiProperty()
-  @IsString()
-  timeClose: string;
-
-  @ApiProperty()
-  @IsNumber()
-  open: number;
-
-  @ApiProperty()
-  @IsNumber()
-  high: number;
-
-  @ApiProperty()
-  @IsNumber()
-  low: number;
-
-  @ApiProperty()
-  @IsNumber()
-  close: number;
-
-  @ApiProperty()
-  @IsNumber()
-  tickVolume: number;
-
-  @ApiProperty()
-  @IsNumber()
-  spreadPoints: number;
-}
-
-export class SubmitHistoricalChunkDto {
-  @ApiProperty({ example: 'EURUSD' })
-  @IsString()
-  @IsNotEmpty()
-  symbol: string;
-
-  @ApiProperty({ example: 0 })
-  @IsNumber()
-  chunkIndex: number;
-
-  @ApiProperty({ type: [HistoricalBarDto] })
-  @IsArray()
-  @ValidateNested({ each: true })
-  @Type(() => HistoricalBarDto)
-  bars: HistoricalBarDto[];
+**Response example:**
+```json
+{
+  "message": "Chunk 15/36 ingested successfully",
+  "symbol": "EURUSD",
+  "chunkNumber": 15,
+  "totalChunks": 36,
+  "barsIngested": 7500,
+  "barsInChunk": 500
 }
 ```
-
-2. **Create command and handler:**
-
-```typescript
-// apps/backend/src/modules/backtest/commands/impl/process-historical-chunk.command.ts
-
-import { HistoricalBarDto } from '../../dto/requests/submit-historical-chunk.dto';
-
-export class ProcessHistoricalChunkCommand {
-  constructor(
-    public readonly symbol: string,
-    public readonly chunkIndex: number,
-    public readonly bars: HistoricalBarDto[],
-  ) {}
-}
-```
-
-```typescript
-// apps/backend/src/modules/backtest/commands/handlers/process-historical-chunk.handler.ts
-
-import { CommandHandler, ICommandHandler } from '@nestjs/cqrs';
-import { Logger } from '@nestjs/common';
-import { ProcessHistoricalChunkCommand } from '../impl/process-historical-chunk.command';
-import { BarM15Repository } from '../../../ea-gateway/domain/repositories/bar-m15.repository';
-import { BackfillStateService } from '../../domain/services/backfill-state.service';
-
-export interface ProcessHistoricalChunkResult {
-  symbol: string;
-  chunkIndex: number;
-  barsIngested: number;
-  totalIngested: number;
-  chunksReceived: number;
-  totalChunks: number;
-  progress: number; // percentage
-}
-
-@CommandHandler(ProcessHistoricalChunkCommand)
-export class ProcessHistoricalChunkHandler implements ICommandHandler<ProcessHistoricalChunkCommand> {
-  private readonly logger = new Logger(ProcessHistoricalChunkHandler.name);
-
-  constructor(
-    private readonly barM15Repository: BarM15Repository,
-    private readonly backfillStateService: BackfillStateService,
-  ) {}
-
-  async execute(command: ProcessHistoricalChunkCommand): Promise<ProcessHistoricalChunkResult> {
-    const { symbol, chunkIndex, bars } = command;
-
-    this.logger.log(`Processing historical chunk ${chunkIndex} for ${symbol}: ${bars.length} bars`);
-
-    // Insert bars into BarM15
-    for (const bar of bars) {
-      await this.barM15Repository.upsert({
-        symbol,
-        timeOpen: new Date(bar.timeOpen),
-        timeClose: new Date(bar.timeClose),
-        open: bar.open,
-        high: bar.high,
-        low: bar.low,
-        close: bar.close,
-        tickVolume: bar.tickVolume,
-        spreadPoints: bar.spreadPoints,
-        source: 'HISTORICAL',
-      });
-    }
-
-    // Update progress
-    const request = this.backfillStateService.incrementProgress(symbol, bars.length);
-
-    if (!request) {
-      this.logger.warn(`No backfill request found for ${symbol} - chunk processed but not tracked`);
-      return {
-        symbol,
-        chunkIndex,
-        barsIngested: bars.length,
-        totalIngested: bars.length,
-        chunksReceived: 1,
-        totalChunks: 1,
-        progress: 100,
-      };
-    }
-
-    const progress = Math.round((request.barsIngested / request.barsRequested) * 100);
-
-    this.logger.log(
-      `Historical backfill progress for ${symbol}: ${request.chunksReceived}/${request.totalChunks} chunks (${progress}%)`,
-    );
-
-    return {
-      symbol,
-      chunkIndex,
-      barsIngested: bars.length,
-      totalIngested: request.barsIngested,
-      chunksReceived: request.chunksReceived,
-      totalChunks: request.totalChunks,
-      progress,
-    };
-  }
-}
-```
-
-3. **Add controller endpoint:**
-
-```typescript
-// apps/backend/src/modules/backtest/controllers/backtest.controller.ts
-
-import { SubmitHistoricalChunkDto } from '../dto/requests/submit-historical-chunk.dto';
-import { ProcessHistoricalChunkCommand } from '../commands/impl/process-historical-chunk.command';
-import { CommandBus } from '@nestjs/cqrs';
-
-@Post('historical-bars/chunk')
-@ApiOperation({ summary: 'Submit a chunk of historical bars from EA' })
-async submitHistoricalChunk(@Body() dto: SubmitHistoricalChunkDto) {
-  return this.commandBus.execute(
-    new ProcessHistoricalChunkCommand(dto.symbol, dto.chunkIndex, dto.bars),
-  );
-}
-```
-
-4. **Register handler in BacktestModule:**
-
-```typescript
-// apps/backend/src/modules/backtest/backtest.module.ts
-
-import { CqrsModule } from '@nestjs/cqrs';
-import { ProcessHistoricalChunkHandler } from './commands/handlers/process-historical-chunk.handler';
-
-@Module({
-  imports: [DatabaseModule, CqrsModule],
-  controllers: [BacktestController],
-  providers: [
-    ...Services,
-    BacktestRunRepository,
-    ProcessHistoricalChunkHandler,
-  ],
-  exports: [BackfillStateService],
-})
-```
-
-**Testable Definition of Done:**
-
-- [ ] `POST /api/backtest/historical-bars/chunk` accepts 500 bars and inserts them
-- [ ] Response shows progress: chunksReceived, totalChunks, progress percentage
-- [ ] Bars are inserted with `source='HISTORICAL'`
-- [ ] Duplicate bars (same symbol + timeOpen) are handled by upsert (no errors)
-- [ ] Progress tracking updates correctly after each chunk
 
 ---
 
 ### Step 5: Completion Endpoint
+**Status:** ✅ Complete
 
-**Goal:** Allow EA to signal completion and clear backfill request.
+**Created:**
+- `CompleteHistoricalBackfillDto`
+- `CompleteHistoricalBackfillCommand` + Handler
+- `POST /api/backtest/historical-backfill/complete` endpoint
 
-**Files to create:**
-
-1. **Create DTO:**
-
-```typescript
-// apps/backend/src/modules/backtest/dto/requests/complete-historical-backfill.dto.ts
-
-import { IsString, IsNotEmpty } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
-
-export class CompleteHistoricalBackfillDto {
-  @ApiProperty({ example: 'EURUSD' })
-  @IsString()
-  @IsNotEmpty()
-  symbol: string;
-}
-```
-
-2. **Add controller endpoint:**
-
-```typescript
-// apps/backend/src/modules/backtest/controllers/backtest.controller.ts
-
-import { CompleteHistoricalBackfillDto } from '../dto/requests/complete-historical-backfill.dto';
-
-@Post('historical-backfill/complete')
-@ApiOperation({ summary: 'EA signals completion of historical backfill' })
-async completeHistoricalBackfill(@Body() dto: CompleteHistoricalBackfillDto) {
-  this.backfillStateService.completeRequest(dto.symbol);
-  return {
-    message: `Historical backfill completed for ${dto.symbol}`,
-  };
-}
-```
-
-**Testable Definition of Done:**
-
-- [ ] `POST /api/backtest/historical-backfill/complete { symbol: "EURUSD" }` clears request
-- [ ] After completion, `GET /api/ea/last-bar?symbol=EURUSD` no longer includes historicalBackfill flag
-- [ ] `GET /api/backtest/backfill-status` no longer shows completed symbol
+**What it does:**
+- Removes backfill request from in-memory state
+- Future `GET /api/ea/last-bar` calls no longer include `historicalBackfill` section
+- Signals backfill process is done
 
 ---
 
 ### Step 6: EA Implementation
+**Status:** ✅ Complete
 
-**Goal:** Modify EA to detect backfill requests and send chunks.
+**Modified:**
+- `HeartbeatEA.mq5` version 1.03 → 1.10
 
-**Files to modify:**
+**Changes:**
+1. **Reordered BackfillMissingBars():**
+   - Now sends normal bars FIRST (priority, <1 second)
+   - Then checks for historical backfill (runs after, 2-3 minutes)
 
-1. **Update HeartbeatEA.mq5:**
+2. **Modified QueryLastBar():**
+   - Returns full JSON response instead of just `timeOpen`
+   - Enables parsing of `historicalBackfill` section
 
-```mql5
-// Add after BackfillMissingBars() function
+3. **Added ExtractTimeOpen():**
+   - Helper function to parse `timeOpen` field from JSON
+   - Handles both null and ISO 8601 string values
 
-//+------------------------------------------------------------------+
-//| CheckHistoricalBackfillRequest                                    |
-//| Called from BackfillMissingBars after parsing last-bar response  |
-//| If historicalBackfill flag detected, executes chunked upload      |
-//+------------------------------------------------------------------+
-void CheckHistoricalBackfillRequest(string lastBarResponse)
-{
-   // Parse historicalBackfill section
-   int backfillPos = StringFind(lastBarResponse, "\"historicalBackfill\"");
-   if(backfillPos < 0)
-      return; // No backfill requested
+4. **Added CheckHistoricalBackfillRequest():**
+   - Parses `historicalBackfill` section from response
+   - Extracts `barsRequested` value
+   - Triggers `ExecuteHistoricalBackfill()` if detected
 
-   // Extract barsCount
-   int barsCountPos = StringFind(lastBarResponse, "\"barsCount\":", backfillPos);
-   if(barsCountPos < 0)
-      return;
+5. **Added ExecuteHistoricalBackfill():**
+   - Fetches all requested bars via `CopyRates()`
+   - Chunks into 500-bar batches
+   - Sends each chunk via `SendHistoricalChunk()`
+   - Logs progress: "chunk 15/36 (500 bars)"
+   - Calls `CompleteHistoricalBackfill()` after all chunks sent
 
-   string substr = StringSubstr(lastBarResponse, barsCountPos + 13);
-   int commaPos = StringFind(substr, ",");
-   int bracePos = StringFind(substr, "}");
-   int endPos = (commaPos > 0 && commaPos < bracePos) ? commaPos : bracePos;
+6. **Added SendHistoricalChunk():**
+   - POST to `/api/backtest/historical-bars/chunk`
+   - 30-second timeout (longer than normal endpoints)
+   - Returns HTTP status code
 
-   string barsCountStr = StringSubstr(substr, 0, endPos);
-   StringTrimLeft(barsCountStr);
-   StringTrimRight(barsCountStr);
-
-   int barsCount = (int)StringToInteger(barsCountStr);
-
-   if(barsCount <= 0)
-      return;
-
-   Print("Historical backfill requested: ", barsCount, " bars for ", Symbol());
-
-   ExecuteHistoricalBackfill(Symbol(), barsCount);
-}
-
-//+------------------------------------------------------------------+
-//| ExecuteHistoricalBackfill                                         |
-//| Fetches historical bars and sends in chunks of 500               |
-//+------------------------------------------------------------------+
-void ExecuteHistoricalBackfill(string symbol, int totalBars)
-{
-   const int CHUNK_SIZE = 500;
-   int totalChunks = (int)MathCeil(totalBars / (double)CHUNK_SIZE);
-
-   Print("Starting historical backfill: ", totalBars, " bars in ", totalChunks, " chunks");
-
-   // Fetch all bars at once
-   MqlRates rates[];
-   ArraySetAsSeries(rates, false); // Chronological order (oldest first)
-
-   int copied = CopyRates(symbol, PERIOD_M15, 0, totalBars, rates);
-
-   if(copied <= 0)
-   {
-      Print("Historical backfill FAILED: CopyRates returned 0");
-      return;
-   }
-
-   Print("Fetched ", copied, " bars from MT5 history");
-
-   // Send in chunks
-   for(int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
-   {
-      int startIdx = chunkIndex * CHUNK_SIZE;
-      int endIdx = MathMin(startIdx + CHUNK_SIZE, copied);
-      int chunkSize = endIdx - startIdx;
-
-      // Build JSON for this chunk
-      string items = "";
-
-      for(int i = startIdx; i < endIdx; i++)
-      {
-         string timeOpen  = TimeToString(rates[i].time,       TIME_DATE | TIME_SECONDS);
-         string timeClose = TimeToString(rates[i].time + 900, TIME_DATE | TIME_SECONDS);
-
-         string item = StringFormat(
-            "{\\\"timeOpen\\\":\\\"%s\\\",\\\"timeClose\\\":\\\"%s\\\",\\\"open\\\":%.5f,\\\"high\\\":%.5f,\\\"low\\\":%.5f,\\\"close\\\":%.5f,\\\"tickVolume\\\":%d,\\\"spreadPoints\\\":%d}",
-            timeOpen, timeClose,
-            rates[i].open, rates[i].high, rates[i].low, rates[i].close,
-            (int)rates[i].tick_volume, (int)rates[i].spread
-         );
-
-         if(i > startIdx)
-            items += ",";
-         items += item;
-      }
-
-      string body = StringFormat(
-         "{\\\"symbol\\\":\\\"%s\\\",\\\"chunkIndex\\\":%d,\\\"bars\\\":[%s]}",
-         symbol, chunkIndex, items
-      );
-
-      int status = SendHistoricalChunk(body);
-
-      if(status != 200)
-      {
-         Print("Historical backfill FAILED: HTTP ", status, " at chunk ", chunkIndex);
-         return;
-      }
-
-      Print("Historical backfill progress: chunk ", chunkIndex + 1, "/", totalChunks, " (", chunkSize, " bars)");
-
-      Sleep(100); // Small delay between chunks
-   }
-
-   // Signal completion
-   CompleteHistoricalBackfill(symbol);
-
-   Print("Historical backfill COMPLETED: ", copied, " bars for ", symbol);
-}
-
-//+------------------------------------------------------------------+
-//| SendHistoricalChunk                                               |
-//+------------------------------------------------------------------+
-int SendHistoricalChunk(string body)
-{
-   string url        = BackendBaseUrl + "/api/backtest/historical-bars/chunk";
-   string reqHeaders = "Content-Type: application/json\r\n";
-   char   postData[];
-   char   result[];
-   string resultHeaders;
-
-   StringToCharArray(body, postData, 0, StringLen(body));
-
-   return WebRequest("POST", url, reqHeaders, 10000, postData, result, resultHeaders);
-}
-
-//+------------------------------------------------------------------+
-//| CompleteHistoricalBackfill                                        |
-//+------------------------------------------------------------------+
-void CompleteHistoricalBackfill(string symbol)
-{
-   string body = StringFormat("{\\\"symbol\\\":\\\"%s\\\"}", symbol);
-
-   string url        = BackendBaseUrl + "/api/backtest/historical-backfill/complete";
-   string reqHeaders = "Content-Type: application/json\r\n";
-   char   postData[];
-   char   result[];
-   string resultHeaders;
-
-   StringToCharArray(body, postData, 0, StringLen(body));
-
-   WebRequest("POST", url, reqHeaders, 5000, postData, result, resultHeaders);
-}
-```
-
-2. **Modify BackfillMissingBars to check for historical backfill:**
-
-```mql5
-void BackfillMissingBars()
-{
-   // ... existing code ...
-
-   string lastKnownIso = QueryLastBar(Symbol());
-
-   // NEW: Check for historical backfill request
-   CheckHistoricalBackfillRequest(lastKnownIso);
-
-   // ... rest of existing backfill logic ...
-}
-```
-
-**Testable Definition of Done:**
-
-- [ ] EA detects `historicalBackfill` flag in last-bar response
-- [ ] EA fetches requested number of bars via `CopyRates()`
-- [ ] EA sends bars in chunks of 500
-- [ ] EA logs progress: "chunk 15/36 (500 bars)"
-- [ ] EA calls completion endpoint after all chunks sent
-- [ ] EA handles HTTP errors gracefully (logs and stops, doesn't crash)
+7. **Added CompleteHistoricalBackfill():**
+   - POST to `/api/backtest/historical-backfill/complete`
+   - Signals backend to clear backfill request
 
 ---
 
@@ -692,75 +412,264 @@ void BackfillMissingBars()
 
 ### Test Case 1: Single Symbol Backfill
 
-1. **Trigger:** `POST /api/backtest/request-historical-backfill { symbol: "EURUSD", barsCount: 17520 }`
-2. **Verify:** `GET /api/backtest/backfill-status` shows active request
-3. **Wait:** EA detects request on next bar close (~15 seconds max)
-4. **Monitor:** EA logs show "chunk 1/36", "chunk 2/36", etc.
-5. **Verify progress:** Call `GET /api/backtest/backfill-status` during upload, see progress increase
-6. **Wait:** ~2-3 minutes for all 36 chunks
-7. **Verify completion:** `GET /api/backtest/backfill-status` shows no active requests
-8. **Query DB:** `SELECT COUNT(*) FROM "BarM15" WHERE symbol='EURUSD' AND source='HISTORICAL'` returns 17520
-9. **Run replay:** `POST /admin/replay-s1-signals { symbol: "EURUSD" }` processes all bars successfully
+1. **Trigger:**
+   ```bash
+   curl -X POST http://localhost:4000/api/backtest/request-historical-backfill \
+     -H "Content-Type: application/json" \
+     -d '{"symbol": "EURUSD", "barsCount": 17520}'
+   ```
+
+2. **Verify request created:**
+   ```bash
+   curl http://localhost:4000/api/backtest/backfill-status
+   # Should show active request with totalChunks: 36
+   ```
+
+3. **Wait for EA detection:**
+   - EA checks on next bar close (max 15 minutes)
+   - Look for log: "Historical backfill requested: 17520 bars for EURUSD"
+
+4. **Monitor upload progress:**
+   - EA logs: "Historical backfill progress: chunk 1/36", "chunk 2/36", etc.
+   - Total time: ~2-3 minutes
+
+5. **Verify completion:**
+   ```bash
+   curl http://localhost:4000/api/backtest/backfill-status
+   # Should return empty array (request cleared)
+   ```
+
+6. **Query database:**
+   ```sql
+   SELECT COUNT(*) FROM "BarM15"
+   WHERE symbol = 'EURUSD' AND source = 'HISTORICAL';
+   -- Should return 17520 (or less if MT5 doesn't have full history)
+   ```
+
+7. **Test S1 detector with historical data:**
+   ```bash
+   curl -X POST http://localhost:4000/admin/replay-s1-signals \
+     -H "Content-Type: application/json" \
+     -d '{"symbol": "EURUSD"}'
+   # Should process all 17520 bars successfully
+   ```
+
+---
 
 ### Test Case 2: Multiple Symbols Concurrently
 
-1. **Trigger 3 symbols:**
-   - `POST /api/backtest/request-historical-backfill { symbol: "EURUSD", barsCount: 17520 }`
-   - `POST /api/backtest/request-historical-backfill { symbol: "GBPUSD", barsCount: 17520 }`
-   - `POST /api/backtest/request-historical-backfill { symbol: "USDJPY", barsCount: 17520 }`
-2. **Verify:** `GET /api/backtest/backfill-status` shows 3 active requests
-3. **Run 3 EA instances:** One chart for each symbol (EURUSD, GBPUSD, USDJPY)
-4. **Monitor:** All 3 EAs upload concurrently (logs interleaved)
-5. **Verify:** All 3 complete within ~3-4 minutes
-6. **Query DB:** All 3 symbols have 17520 bars with `source='HISTORICAL'`
+1. **Trigger 3 backfills:**
+   ```bash
+   curl -X POST http://localhost:4000/api/backtest/request-historical-backfill \
+     -d '{"symbol": "EURUSD", "barsCount": 17520}'
+
+   curl -X POST http://localhost:4000/api/backtest/request-historical-backfill \
+     -d '{"symbol": "GBPUSD", "barsCount": 17520}'
+
+   curl -X POST http://localhost:4000/api/backtest/request-historical-backfill \
+     -d '{"symbol": "USDJPY", "barsCount": 17520}'
+   ```
+
+2. **Verify 3 active requests:**
+   ```bash
+   curl http://localhost:4000/api/backtest/backfill-status
+   # Should show 3 objects in array
+   ```
+
+3. **Run 3 EA instances:**
+   - Open 3 MT5 charts: EURUSD M15, GBPUSD M15, USDJPY M15
+   - Attach HeartbeatEA to each chart
+
+4. **Monitor concurrent uploads:**
+   - All 3 EAs upload simultaneously
+   - Backend async handlers process chunks concurrently
+   - Total time: ~3-4 minutes for all 3 symbols
+
+5. **Verify database:**
+   ```sql
+   SELECT symbol, COUNT(*) as bars
+   FROM "BarM15"
+   WHERE source = 'HISTORICAL'
+   GROUP BY symbol;
+   -- Should show 17520 bars for each symbol
+   ```
+
+---
 
 ### Test Case 3: Resume After Interruption
 
-1. **Trigger:** `POST /api/backtest/request-historical-backfill { symbol: "EURUSD", barsCount: 17520 }`
-2. **Wait:** Let EA upload 10 chunks (monitor logs)
-3. **Stop EA:** Close MT5 or disable EA
-4. **Verify DB:** ~5000 bars inserted (10 chunks × 500)
-5. **Restart EA:** Recompile and attach to chart
-6. **Monitor:** EA continues from where it left off (upsert handles duplicates)
-7. **Verify completion:** All 17520 bars eventually in DB
-8. **Check duplicates:** No duplicate rows (unique constraint on symbol + timeOpen)
+1. **Trigger backfill:**
+   ```bash
+   curl -X POST http://localhost:4000/api/backtest/request-historical-backfill \
+     -d '{"symbol": "EURUSD", "barsCount": 17520}'
+   ```
+
+2. **Let EA upload 10 chunks:**
+   - Monitor logs: "chunk 1/36", "chunk 2/36", ..., "chunk 10/36"
+
+3. **Stop EA:**
+   - Close MT5 or disable EA mid-upload
+
+4. **Verify partial data:**
+   ```sql
+   SELECT COUNT(*) FROM "BarM15"
+   WHERE symbol = 'EURUSD' AND source = 'HISTORICAL';
+   -- Should show ~5000 bars (10 chunks × 500)
+   ```
+
+5. **Restart EA:**
+   - Recompile and attach to EURUSD M15 chart
+
+6. **Observe resumption:**
+   - EA continues uploading from chunk 11
+   - Upsert handles duplicate bars (no errors)
+   - Logs: "chunk 11/36", "chunk 12/36", ..., "chunk 36/36"
+
+7. **Verify completion:**
+   ```sql
+   SELECT COUNT(*) FROM "BarM15"
+   WHERE symbol = 'EURUSD' AND source = 'HISTORICAL';
+   -- Should show full 17520 bars
+
+   SELECT symbol, "timeOpen", COUNT(*) as duplicates
+   FROM "BarM15"
+   WHERE symbol = 'EURUSD' AND source = 'HISTORICAL'
+   GROUP BY symbol, "timeOpen"
+   HAVING COUNT(*) > 1;
+   -- Should return 0 rows (no duplicates thanks to unique constraint)
+   ```
+
+---
+
+## Future Improvements
+
+### 1. Redis State Management
+
+**Current:** In-memory Map in `BackfillStateService`
+
+**Problem:** If backend restarts during 2-3 minute upload, state is lost. EA continues sending chunks, backend rejects with 404 (no active request).
+
+**Solution:** Store backfill requests in Redis
+```typescript
+// Use ioredis or @nestjs/redis
+await redis.hset(`backfill:${symbol}`, {
+  barsRequested: 17520,
+  barsIngested: 7500,
+  chunksReceived: 15,
+  totalChunks: 36,
+  createdAt: new Date().toISOString()
+});
+```
+
+**Benefits:**
+- State persists across backend restarts
+- Horizontal scaling (multiple backend instances share state)
+- Better for production environments
+
+**When to implement:** Before deploying to production with multiple backend instances
+
+---
+
+### 2. BullMQ Background Jobs
+
+**Current:** Chunk ingestion runs synchronously in HTTP request handler
+
+**Problem:** Long-running upserts (500 bars) block HTTP response. If multiple EAs upload concurrently, may impact live bar ingestion latency.
+
+**Solution:** Offload chunk processing to BullMQ background jobs
+```typescript
+// In IngestHistoricalChunkHandler:
+await this.chunkQueue.add('ingest-chunk', {
+  symbol: command.symbol,
+  chunkNumber: command.chunkNumber,
+  bars: command.bars
+});
+
+// Return immediately (202 Accepted)
+return {
+  message: "Chunk queued for processing",
+  queuePosition: await this.chunkQueue.count()
+};
+
+// Separate worker processes chunks asynchronously
+```
+
+**Benefits:**
+- HTTP endpoints return instantly (202 Accepted)
+- Live bar ingestion never blocked by historical uploads
+- Better concurrency (workers scale independently)
+- Built-in retry logic for failed chunks
+
+**When to implement:** If we observe latency impact on live bar ingestion during concurrent backfills
+
+---
+
+### 3. Progress Tracking via WebSocket
+
+**Current:** Admin polls `GET /api/backtest/backfill-status` for progress
+
+**Future:** WebSocket events push progress updates to admin UI
+```typescript
+// Backend emits events:
+this.eventGateway.emit('backfill:progress', {
+  symbol: 'EURUSD',
+  progress: 42, // percentage
+  chunksReceived: 15,
+  totalChunks: 36
+});
+
+// Admin UI subscribes and updates progress bar in real-time
+```
+
+**When to implement:** When building admin UI dashboard (future milestone)
 
 ---
 
 ## Definition of Done (Complete Milestone)
 
-- [ ] Backend accepts backfill trigger via `POST /api/backtest/request-historical-backfill`
-- [ ] `GET /api/ea/last-bar` includes historicalBackfill flag when requested
-- [ ] EA detects flag and executes chunked upload automatically
-- [ ] Chunks are processed and inserted into BarM15 with `source='HISTORICAL'`
-- [ ] Progress is tracked and visible via `GET /api/backtest/backfill-status`
-- [ ] Completion endpoint clears backfill request
-- [ ] 17,520 bars for EURUSD load successfully in ~2-3 minutes
-- [ ] Multiple symbols can backfill concurrently (tested with 3 symbols)
-- [ ] Unique constraint prevents duplicates (idempotent uploads)
-- [ ] Replay endpoints (Asia Range, S1 signals) work with full 6-month dataset
-- [ ] EA handles errors gracefully (logs, doesn't crash)
+- ✅ Backend accepts backfill trigger via `POST /api/backtest/request-historical-backfill`
+- ✅ `GET /api/ea/last-bar` includes historicalBackfill flag when requested
+- ✅ EA detects flag and executes chunked upload automatically
+- ✅ Chunks are processed and inserted into BarM15 with `source='HISTORICAL'`
+- ✅ Progress is tracked and visible via `GET /api/backtest/backfill-status`
+- ✅ Completion endpoint clears backfill request
+- ✅ Normal bar ingestion happens FIRST (never delayed by historical backfill)
+- ✅ Custom exceptions (BackfillNotFoundException, ChunkValidationException) map to correct HTTP status codes
+- ✅ Repository pattern isolates Prisma (architecture compliance)
+- ✅ CQRS pattern used for all POST endpoints (architecture compliance)
+
+**Ready for testing:**
+- 17,520 bars for EURUSD can load in ~2-3 minutes
+- Multiple symbols can backfill concurrently
+- Unique constraint prevents duplicates (idempotent uploads)
+- Replay endpoints (Asia Range, S1 signals) work with full 6-month dataset
 
 ---
 
 ## Notes
 
 **Why 500 bars per chunk?**
-- Chunk size: ~133 KB (small enough for reliable network transmission)
-- Processing time: ~1-2 seconds per chunk (backend inserts 500 bars)
+- Chunk size: ~133 KB (small, reliable network transmission)
+- Processing time: ~1-2 seconds per chunk (500 upserts)
 - Total time: 36 chunks × 2s = ~72 seconds + network overhead = ~2-3 minutes
 
 **Why in-memory state?**
-- Simple for M4.5 (no DB schema changes needed)
-- Fast lookups on every `GET /api/ea/last-bar` call
-- Optional: Migrate to DB or Redis later for persistence across backend restarts
+- Simple, fast for M4.5 (no Redis dependency yet)
+- Backfill completes in 2-3 minutes (low risk of backend restart)
+- Can migrate to Redis later if needed (see Future Improvements)
 
-**Why piggyback on last-bar?**
-- Zero extra HTTP polling (reuses existing 1/second check that only triggers on bar close)
-- EA naturally checks every bar close, perfect for triggering backfill
-- No new timer/polling logic in EA needed
+**Why piggyback on last-bar endpoint?**
+- Zero extra HTTP polling (reuses existing bar-close check)
+- EA naturally checks every bar close (perfect trigger point)
+- No new timer/polling logic needed in EA
 
-**Source field differentiation:**
-- `FTMO_LIVE` - Real-time bars from live EA
-- `HISTORICAL` - Backfilled bars from this M4.5 implementation
-- Allows filtering/debugging if needed
+**Why chunk uploads instead of single POST?**
+- 17,520 bars = ~4.54 MB payload (within 14 MiB limit but risky)
+- Chunking enables progress tracking, resumption, and avoids timeouts
+- Slightly slower but much more resilient
+
+**Symbol scoping:**
+- EA is attached to specific symbol in MT5 (e.g., EURUSD M15 chart)
+- EA only operates on that symbol (Symbol() in MQL5)
+- Backend checks backfill request for that exact symbol
+- No ambiguity, no cross-symbol uploads

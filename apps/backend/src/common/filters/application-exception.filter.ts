@@ -6,7 +6,9 @@ import { Response } from 'express';
  * Add entries here as new domain exceptions are created.
  */
 const EXCEPTION_STATUS_MAP: Record<string, number> = {
-  // Example: NotFoundException: 404
+  // Backtest module exceptions
+  BackfillNotFoundException: 404,
+  ChunkValidationException: 400,
 };
 
 @Catch()

@@ -147,10 +147,233 @@ src/
 
 ## Exception Rules
 
-- Every domain failure is a named exception class extending `Error`, with `this.name` set to the class name.
-- Exception classes live in `exceptions/` inside the module.
-- One global `ApplicationExceptionFilter` maps exception names to HTTP status codes.
-- Never throw NestJS `HttpException` subclasses from inside domain or service layers.
+### Philosophy
+
+**Domain exceptions are NOT HTTP exceptions.** Domain logic throws semantic errors (`BackfillNotFoundException`, `InvalidBarDataException`) that describe _what went wrong in business terms_. The `ApplicationExceptionFilter` translates these into appropriate HTTP responses.
+
+### Exception Class Pattern
+
+Every domain exception follows this pattern:
+
+```typescript
+/**
+ * Thrown when [business condition].
+ * This indicates [what it means / why it happened].
+ */
+export class MyDomainException extends Error {
+  constructor(
+    public readonly contextField1: string,
+    public readonly contextField2: number,
+  ) {
+    super(`Descriptive message with ${contextField1} and ${contextField2}`);
+    this.name = 'MyDomainException';
+  }
+}
+```
+
+**Rules**:
+- Extend `Error` (never `HttpException`)
+- Set `this.name = 'ClassName'` (used by filter for mapping)
+- Accept context as constructor parameters (marked `public readonly`)
+- Generate descriptive message in `super()`
+- Add JSDoc explaining when thrown and what it indicates
+
+### File Structure
+
+```typescript
+// src/modules/<module>/domain/exceptions/my-domain.exception.ts
+export class MyDomainException extends Error { ... }
+
+// src/modules/<module>/domain/exceptions/index.ts
+export { MyDomainException } from './my-domain.exception';
+export { AnotherException } from './another.exception';
+```
+
+### Global Exception Filter
+
+**File**: `src/common/filters/application-exception.filter.ts`
+
+The global `@Catch()` filter handles ALL exceptions:
+
+1. **NestJS HttpExceptions** (e.g., from guards, pipes, built-in validation) → pass through with original status
+2. **Custom domain exceptions** → map `exception.name` to HTTP status via `EXCEPTION_STATUS_MAP`
+3. **Unknown errors** → return 500, log full stack trace
+
+**Adding a new exception**:
+
+```typescript
+// src/common/filters/application-exception.filter.ts
+const EXCEPTION_STATUS_MAP: Record<string, number> = {
+  // Module: backtest
+  BackfillNotFoundException: 404,
+  ChunkValidationException: 400,
+
+  // Module: strategy
+  InvalidBarDataException: 422,    // Unprocessable Entity
+  InvalidAsiaRangeException: 422,
+};
+```
+
+**HTTP status code guidelines**:
+- `400 Bad Request` — Client sent invalid data (validation, format)
+- `404 Not Found` — Resource doesn't exist
+- `409 Conflict` — Resource exists but operation conflicts with current state
+- `422 Unprocessable Entity` — Request valid but semantically incorrect (e.g., invalid OHLC)
+- `500 Internal Server Error` — Unexpected/unknown errors (logged with stack trace)
+
+### Where to Throw Exceptions
+
+| Layer | Can throw | Cannot throw | Example |
+|-------|-----------|--------------|---------|
+| **Domain/Services** | Custom domain exceptions, plain `Error` | `HttpException` subclasses | `throw new BackfillNotFoundException(symbol)` |
+| **Command/Query Handlers** | Custom domain exceptions, plain `Error` | `HttpException` subclasses | `throw new ChunkValidationException(...)` |
+| **Controllers** | Nothing (delegates to CommandBus/QueryBus) | Any exception | No throw statements |
+| **Guards** | `UnauthorizedException`, `ForbiddenException` (NestJS built-ins OK here) | Custom domain exceptions | `throw new UnauthorizedException()` |
+| **Pipes** | `BadRequestException` (NestJS built-in OK here) | Custom domain exceptions | NestJS `ValidationPipe` handles this |
+
+### Response Format
+
+All exceptions return this JSON structure:
+
+```json
+{
+  "statusCode": 404,
+  "error": "BackfillNotFoundException",
+  "message": "No active backfill request found for EURUSD. Please trigger a backfill request first."
+}
+```
+
+**Fields**:
+- `statusCode`: HTTP status (from `EXCEPTION_STATUS_MAP` or 500)
+- `error`: Exception class name (`exception.name`)
+- `message`: Descriptive message (`exception.message`)
+
+### Logging Behavior
+
+The filter logs based on severity:
+
+```typescript
+if (status >= 500) {
+  this.logger.error(exception.message, exception.stack);  // Full stack trace
+}
+// Client errors (400, 404, etc.) are NOT logged — expected conditions
+```
+
+**Why?**
+- 5xx errors = server bugs → need stack traces for debugging
+- 4xx errors = client mistakes → expected, no logging pollution
+
+### Example: Complete Exception Flow
+
+**1. Create exception class**:
+```typescript
+// src/modules/backtest/domain/exceptions/backfill-not-found.exception.ts
+export class BackfillNotFoundException extends Error {
+  constructor(public readonly symbol: string) {
+    super(`No active backfill request found for ${symbol}. Please trigger a backfill request first.`);
+    this.name = 'BackfillNotFoundException';
+  }
+}
+```
+
+**2. Register in filter**:
+```typescript
+// src/common/filters/application-exception.filter.ts
+const EXCEPTION_STATUS_MAP: Record<string, number> = {
+  BackfillNotFoundException: 404,
+};
+```
+
+**3. Throw from handler**:
+```typescript
+// src/modules/backtest/commands/handlers/ingest-historical-chunk.handler.ts
+const request = this.backfillStateService.getRequest(symbol);
+if (!request) {
+  throw new BackfillNotFoundException(symbol);
+}
+```
+
+**4. Client receives**:
+```bash
+POST /api/backtest/historical-bars/chunk
+# Response: 404
+{
+  "statusCode": 404,
+  "error": "BackfillNotFoundException",
+  "message": "No active backfill request found for EURUSD. Please trigger a backfill request first."
+}
+```
+
+### Never Do This ❌
+
+```typescript
+// ❌ WRONG: Throwing HttpException from service
+@Injectable()
+export class MyService {
+  doSomething() {
+    if (!found) {
+      throw new NotFoundException('Not found');  // ❌ HTTP concern in domain layer
+    }
+  }
+}
+
+// ❌ WRONG: Generic Error without context
+throw new Error('Something went wrong');  // ❌ Not semantic, always 500
+
+// ❌ WRONG: Not setting this.name
+export class MyException extends Error {
+  constructor(msg: string) {
+    super(msg);
+    // ❌ Missing: this.name = 'MyException';
+  }
+}
+```
+
+### Do This Instead ✅
+
+```typescript
+// ✅ CORRECT: Custom domain exception
+export class ResourceNotFoundException extends Error {
+  constructor(public readonly resourceType: string, public readonly id: string) {
+    super(`${resourceType} with ID ${id} not found`);
+    this.name = 'ResourceNotFoundException';
+  }
+}
+
+// Usage
+throw new ResourceNotFoundException('BackfillRequest', symbol);
+
+// Registered in filter
+const EXCEPTION_STATUS_MAP: Record<string, number> = {
+  ResourceNotFoundException: 404,
+};
+```
+
+### Validation Errors (NestJS Built-in)
+
+**Input validation via `class-validator`** is handled automatically by NestJS `ValidationPipe`:
+
+```typescript
+// DTO
+export class MyDto {
+  @IsString()
+  @IsNotEmpty()
+  symbol!: string;
+}
+
+// Invalid request body
+POST /api/endpoint
+{ "symbol": "" }
+
+// Automatic response: 400
+{
+  "statusCode": 400,
+  "message": ["symbol should not be empty"],
+  "error": "Bad Request"
+}
+```
+
+**No custom code needed** — NestJS ValidationPipe + ApplicationExceptionFilter handle it automatically.
 
 ## DTO Rules
 
