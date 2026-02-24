@@ -59,6 +59,8 @@ export class ReplayS1SignalsHandler implements ICommandHandler<
     for (let i = 0; i < bars.length; i++) {
       const bar = bars[i];
 
+      this.logProgress(i, bars.length, signalsDetected, validSignals, invalidSignals);
+
       try {
         const result = await this.processBar(i, bars, asiaRangesByDate, symbol);
 
@@ -89,6 +91,21 @@ export class ReplayS1SignalsHandler implements ICommandHandler<
       valid: validSignals,
       invalid: invalidSignals,
     };
+  }
+
+  private logProgress(
+    currentIndex: number,
+    total: number,
+    signalsDetected: number,
+    validSignals: number,
+    invalidSignals: number,
+  ): void {
+    if (currentIndex > 0 && currentIndex % 1000 === 0) {
+      const progress = Math.round((currentIndex / total) * 100);
+      this.logger.log(
+        `Progress: ${currentIndex}/${total} bars (${progress}%) | signals=${signalsDetected} valid=${validSignals} invalid=${invalidSignals}`,
+      );
+    }
   }
 
   private async processBar(
